@@ -15,6 +15,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -32,6 +34,7 @@ import (
 
 const (
 	maxTranscodeBody = 1 << 20 // 协议转换读取请求体的上限：1MB
+	maxBodyBytes     = 8 << 20 // 反代链路的请求体上限：8MB —— 流式转发若没有上限，单个请求就能打满上游/磁盘（审计 P0-3）
 	accessLogKeep    = 200     // 内存中保留的访问日志条数
 	debugLogTail     = 50      // /debug/logs 返回的条数
 )
@@ -141,6 +144,26 @@ func (w *statusWriter) Flush() {
 	}
 }
 
+// Unwrap 让 http.ResponseController 能剥到包装下面的原始 ResponseWriter。
+//
+// ⚠️ 这层不是可选的：ReverseProxy 处理 101 协议升级时走
+// `http.NewResponseController(rw).Hijack()`（net/http/httputil/reverseproxy.go:838-841），
+// 而 ResponseController 只认 `http.Hijacker` 或 `Unwrap() http.ResponseWriter`
+// （net/http/responsecontroller.go:66-75）。两个都不提供时它返回 ErrNotSupported，
+// 升级请求会被 ErrorHandler 答成 502 —— 即「宣称支持 WebSocket，实际 100% 失败」（审计 P0-1，已实测复现）。
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// ReadFrom 转发底层的零拷贝路径（sendfile），否则大响应体会退化成用户态缓冲拷贝。
+// 必须转发到**原始 writer**：转发到 w 自己会因为 w 也实现了 ReaderFrom 而无限递归。
+func (w *statusWriter) ReadFrom(r io.Reader) (int64, error) {
+	if !w.wrote {
+		w.status, w.wrote = http.StatusOK, true
+	}
+	n, err := io.Copy(w.ResponseWriter, r)
+	w.bytes += n
+	return n, err
+}
+
 func writeJSON(w http.ResponseWriter, status int, obj any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -168,9 +191,31 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		g.metrics.IncInflight(-1)
 		entry.Status, entry.Latency, entry.Bytes = sw.status, time.Since(start), sw.bytes
-		entry.Err = proxy.ErrFrom(r)
+		// 只在真的取到上游错误时才覆盖 Err —— 否则会把 panic 兜底写下的错误信息抹掉
+		if e := proxy.ErrFrom(r); e != "" {
+			entry.Err = e
+		}
 		g.metrics.Observe(entry.Route, entry.Status, entry.Latency)
 		g.alog.Write(entry)
+	}()
+
+	// ⑦′ panic 兜底：注册在收口之后 —— defer 是 LIFO，所以它会**先**执行，再把结果交给收口记录。
+	//
+	// 为什么必须有：net/http 自己在每个连接 goroutine 上有 recover（server.go 的 conn.serve），
+	// 所以 panic 不会让进程崩掉，但客户端只会看到连接被重置（HTTP 000 / curl exit 52），
+	// 而 /metrics 与 /debug/logs 里**什么都留不下** —— 这比崩溃更难排查（本机实测过，审计 P0-2）。
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		g.metrics.IncPanic()
+		entry.Err = fmt.Sprintf("panic: %v", rec)
+		fmt.Fprintf(os.Stderr, "gateway panic: %v\n%s\n", rec, debug.Stack())
+		// 响应头已经发出去了就补不了 500（客户端已收到部分内容），此时只留日志与指标。
+		if !sw.wrote {
+			fail(sw, http.StatusInternalServerError, "internal_error", "网关内部错误", traceID)
+		}
 	}()
 
 	// ===== 网关自身的端点：不经过路由与鉴权 =====
@@ -192,6 +237,18 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	entry.Route, entry.MatchWhy = m.Route.Name, m.Reason
+
+	// ===== 请求体上限（放在鉴权之前：明显超限的请求不必再花鉴权/限流的成本）=====
+	// 反代是流式转发的，没有上限就等于允许任意大的请求体打满上游/磁盘（审计 P0-3）。
+	// 两段式：先按 Content-Length 快速拒绝，再用 MaxBytesReader 兜住 chunked / 谎报长度的情况
+	//（后者只在真正读取时才暴露，由 proxy 映射成 413；必须传原始 w 让 requestTooLarge() 断言生效）。
+	if r.ContentLength > maxBodyBytes {
+		entry.Err = "body_too_large"
+		fail(sw, http.StatusRequestEntityTooLarge, "body_too_large",
+			fmt.Sprintf("请求体超过上限 %d 字节", int64(maxBodyBytes)), traceID)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 
 	if m.Route.Upstream == "self" {
 		writeJSON(sw, http.StatusOK, map[string]string{"status": "ok", "trace": traceID})

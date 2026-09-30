@@ -99,6 +99,13 @@ func New(upstream *config.Upstream, stripPrefix string) *Proxy {
 				status, msg = http.StatusGatewayTimeout, "upstream timeout"
 			case isConnRefused(err):
 				status, msg = http.StatusBadGateway, "upstream refused"
+			default:
+				// 请求体超限：gateway 用 http.MaxBytesReader 兜住 chunked / 谎报 Content-Length
+				// 的情况，错误只在真正读取时才暴露，这里把它映射成 413 而不是 502（审计 P0-3）。
+				var mbe *http.MaxBytesError
+				if errors.As(err, &mbe) {
+					status, msg = http.StatusRequestEntityTooLarge, "request body too large"
+				}
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)

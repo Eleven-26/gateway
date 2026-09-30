@@ -41,6 +41,16 @@
 - ④ 演示服务 `slow-svc`（`least_conn`，19001/19002/19003）+ `/slow` 路由；
   演示后端支持 `?ms=<毫秒>` 人为延时（**上限 5s**，见 `cmd/backend`）——用它占住连接，
   否则 `least_conn` 看不出差别（串行请求在途恒为 0，退化成平局轮转）。
+- **请求体上限 `maxBodyBytes = 8MB`**（`internal/gateway/gateway.go`）：路由匹配后、鉴权前按
+  `Content-Length` 直接拒绝，并用 `MaxBytesReader` 兜底超限读取；超限 → **413**
+  （由 `internal/proxy/proxy.go` 的 `proxy.ErrorHandler` 映射）。
+- **`http.Server` 读写超时**（`cmd/gateway/main.go`）：`ReadTimeout 30s`、
+  `WriteTimeout = 配置里最大 Service.Timeout + 15s`（新 API `config.MaxServiceTimeout()`，
+  `internal/config/config.go`）。⚠️ `WriteTimeout` 会掐断超过该时长的长连接流式响应（SSE）；
+  要长流需按路由放宽或用 `http.ResponseController.SetWriteDeadline` 续期。
+- **JWT 必须带 `exp` 且寿命 ≤24h**（`internal/auth/auth.go` 的 `maxTokenLifetime = 24h`）：
+  `exp == 0` 直接拒（401 `token_no_expiry`）；`iat` 存在时校验 `exp-iat ≤ 24h`
+  （超长 → `token_too_long_lived`）；`SignJWT` 自动补 `iat`。
 
 ## 3. 本机运行注意事项（实测踩过）
 
@@ -58,6 +68,8 @@
 - `go build -o bin/gateway` 产物名就是 `bin/gateway`（`-o` 指定精确名，不自动补 `.exe`），
   因此**不要**用 `./bin/gateway.exe` 去启动。
 - `go vet ./...` 前台执行偶发 SIGTERM，长命令统一后台跑。
+- **`go test -race` 在本机不可用**：`CGO_ENABLED=0` 且无 gcc，报 `-race requires cgo`；
+  竞态检测只能放 CI（Linux）。
 
 ## 4. 生产口径与上线红线
 
@@ -95,6 +107,25 @@
 > （`for addr, c := range b.conns`，Go 小 map 迭代起点随机但首元素占优），实测全 0 平局时
 > 78% 集中到列表首节点（a:1=777 / b:1=116 / c:1=107，全 0 平局）；现按轮转起点取最小、平局轮流
 > （999 次 = 333/333/333）。
+>
+> **批次 A：5 条 P0（按 `docs/网关缺陷审计与优化路线.md` 修复）**：
+> 1. **协议升级（WebSocket）**：`statusWriter` 增加 `Unwrap() http.ResponseWriter`
+>    （`internal/gateway/gateway.go:154`）与 `ReadFrom`（:158）—— `ReverseProxy` 用
+>    `http.NewResponseController(rw).Hijack()` 取连接，Controller 只认 `Hijacker` 或 `Unwrap()`，
+>    此前任何 `Connection: Upgrade` 请求都被答成 **502**；实测新增用例 `TestWebSocketUpgrade`
+>    拿到 **101**，升级后双向数据可通。
+> 2. **panic 兜底**：`ServeHTTP` 新增 ⑦′ panic 兜底 `defer`（`gateway.go:202-218`，
+>    LIFO 下先于收口执行）；`/metrics` 新增 **`gw_panics_total`**（`internal/observability/observ.go:251`）。
+> 3. **请求体上限 8MB**：`maxBodyBytes = 8 << 20`（`gateway.go:37`），路由匹配后、鉴权前按
+>    `Content-Length` 拒绝 + `MaxBytesReader` 兜底；`proxy.ErrorHandler` 把超限错误映射成 **413**
+>    （`internal/proxy/proxy.go:105-107`）；实测 raw socket 伪造 9MB `Content-Length` → `HTTP/1.1 413`。
+> 4. **服务端读写超时**：`cmd/gateway/main.go:48` `ReadTimeout: 30s`、`:52`
+>    `WriteTimeout: cfg.MaxServiceTimeout() + 15s`；新增 `config.MaxServiceTimeout()`
+>    （`internal/config/config.go:19`）—— 实测生效，长流取舍见 §2。
+> 5. **JWT 强制 `exp` + 寿命上限**：`internal/auth/auth.go` 新增 `ErrNoExpiry`（:32）与
+>    `maxTokenLifetime = 24h`（:39）；`exp == 0` 直接拒（:143-144）；`iat` 存在时校验 `exp-iat ≤ 24h`；
+>    `SignJWT` 自动补 `iat`，错误码新增 `token_no_expiry` / `token_too_long_lived`；实测无 `exp`
+>    的 token 由原来的 **200** 变成 **401 `token_no_expiry`**。
 
 ## 6. 文档同步要求
 

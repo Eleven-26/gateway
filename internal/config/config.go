@@ -14,6 +14,18 @@ type Config struct {
 // Service 按名取上游服务，不存在时返回 nil。
 func (c *Config) Service(name string) *Service { return c.Services[name] }
 
+// MaxServiceTimeout 返回所有上游服务里最大的 Timeout —— cmd/gateway 用它推导 http.Server
+// 的 WriteTimeout（必须容得下最慢的一次上游往返）。没有服务时返回 0。
+func (c *Config) MaxServiceTimeout() time.Duration {
+	var max time.Duration
+	for _, s := range c.Services {
+		if s != nil && s.Timeout > max {
+			max = s.Timeout
+		}
+	}
+	return max
+}
+
 // Default 返回演示用配置：9 条路由 + 6 个上游服务，覆盖全部七级流水线。
 //
 // 密钥是硬编码的演示值，切勿用于生产。

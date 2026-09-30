@@ -43,7 +43,14 @@ func run() error {
 		Addr:              cfg.ListenAddr,
 		Handler:           gw,
 		ReadHeaderTimeout: 3 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// ReadTimeout 覆盖「请求体读取」：只设 ReadHeaderTimeout 时，慢速滴流的 body
+		// 能长期占住连接与 goroutine（审计 P0-4）。
+		ReadTimeout: 30 * time.Second,
+		// WriteTimeout 由配置里最大的 Service.Timeout 推导 + 余量，必须容得下最慢的上游往返。
+		// ⚠️ 它会掐断超过该时长的「长连接流式响应」（SSE）；要支持长流需按路由放宽，
+		// 或在该路由里用 http.ResponseController.SetWriteDeadline 续期。
+		WriteTimeout: cfg.MaxServiceTimeout() + 15*time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	printBanner(cfg)

@@ -141,6 +141,12 @@ for i in $(seq 1 3); do curl -s -o /dev/null -w "%{http_code} " http://127.0.0.1
 （演示配置里的 `fallback` **已删除**，生产接入时不要加回——否则前端拼错路径会静默打到订单服务，404 永不触发）、
 给 `/metrics` 与 `/debug/logs` 加访问控制。
 
+同时确认网关自身的四项能力符合预期：**请求体上限 8MB**（超限返回 **413**）；`http.Server` 已设
+**`ReadTimeout` 30s** 与 **`WriteTimeout` = 配置里最大 `Service.Timeout` + 15s**（⚠️ 超过该时长的长连接
+流式响应（SSE）会被掐断，要长流需按路由放宽或用 `http.ResponseController.SetWriteDeadline` 续期）；
+**JWT 必须带 `exp` 且寿命 ≤24h**（缺失 → 401 `token_no_expiry`，超长 → `token_too_long_lived`）；
+`ServeHTTP` 里的 panic 会被兜底成 500 并计入 `/metrics` 的 **`gw_panics_total`**。
+
 完整的改造清单、热重载实现细节与上线检查清单见
 [`docs/生产部署与接入新服务.md`](docs/生产部署与接入新服务.md)。
 
@@ -160,11 +166,15 @@ for i in $(seq 1 3); do curl -s -o /dev/null -w "%{http_code} " http://127.0.0.1
 其中多副本状态外化属于「上线前必须解决」，改造方案与完整检查清单见
 [`docs/生产部署与接入新服务.md`](docs/生产部署与接入新服务.md)。
 
+> 本列表只记项目自身在 `docs/项目分析与执行链路.md` 第 8 节列出的缺口。完整的独立审计
+> （P0/P1/P2 与对标标准网关的能力矩阵）见 [`docs/网关缺陷审计与优化路线.md`](docs/网关缺陷审计与优化路线.md)；
+> 其中 5 条 P0 已于本轮修复。
+
 ## 开发
 
 ```bash
 make fmt    # gofmt
 make vet    # go vet
-make test   # go test（现有均衡器单元测试：Pick/Done 配对、并发配对、平局公平性、工厂分发）
+make test   # go test（4 个包共 13 个用例：balancer（配对/平局/工厂）、auth（exp 策略/nbf/API Key）、config（MaxServiceTimeout）、gateway（WebSocket 升级/panic 兜底/413/正常转发））
 make build  # 编译到 bin/
 ```

@@ -145,6 +145,7 @@ type Metrics struct {
 	limitHits map[string]int64
 	cbTrips   map[string]int64
 	inflight  int64
+	panics    int64
 }
 
 // NewMetrics 创建指标集合。
@@ -188,6 +189,14 @@ func (m *Metrics) IncLimit(route string) {
 func (m *Metrics) IncTrip(service string) {
 	m.mu.Lock()
 	m.cbTrips[service]++
+	m.mu.Unlock()
+}
+
+// IncPanic 记一次被兜底捕获的 panic。这类错误以前只走 stderr，
+// /metrics 与 /debug/logs 里完全看不到（审计 P0-2）。
+func (m *Metrics) IncPanic() {
+	m.mu.Lock()
+	m.panics++
 	m.mu.Unlock()
 }
 
@@ -239,5 +248,6 @@ func (m *Metrics) Render() string {
 	}
 
 	fmt.Fprintf(&b, "# HELP gw_inflight_requests 在处理中的请求数\n# TYPE gw_inflight_requests gauge\ngw_inflight_requests %d\n", m.inflight)
+	fmt.Fprintf(&b, "# HELP gw_panics_total 被网关兜底捕获的 panic 次数\n# TYPE gw_panics_total counter\ngw_panics_total %d\n", m.panics)
 	return b.String()
 }

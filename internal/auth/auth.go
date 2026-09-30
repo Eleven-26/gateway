@@ -5,7 +5,8 @@
 //
 //	① 签名覆盖的是「前两段的原始字符串」，不是解析后的 JSON（否则顺序一变签名就失效）；
 //	② 验签必须用 hmac.Equal（恒定时间比较），不能用 ==（会被时序攻击）；
-//	③ exp/nbf 是业务校验，签名过了不代表没过期。
+//	③ exp/nbf 是业务校验，签名过了不代表没过期；且 **exp 必须存在** ——
+//	   「没有 exp 就不过期」等于签一次永久通行（审计 P0-5 修掉了这一点）。
 package auth
 
 import (
@@ -28,14 +29,21 @@ var (
 	ErrBadFormat    = errors.New("凭证格式错误")
 	ErrBadSignature = errors.New("签名不合法")
 	ErrExpired      = errors.New("凭证已过期")
+	ErrNoExpiry     = errors.New("凭证没有 exp（必须带过期时间）")
+	ErrTooLongLived = errors.New("凭证寿命超过上限")
 	ErrForbidden    = errors.New("权限不足")
 )
+
+// maxTokenLifetime 令牌寿命上限（exp - iat）。签名有效但寿命过长的令牌一律拒绝，
+// 避免「签一次永久通行」——没有这个上限时，密钥泄露或内部误签发就没有止损点。
+const maxTokenLifetime = 24 * time.Hour
 
 // Claims 是网关关心的 JWT 载荷字段。
 type Claims struct {
 	Sub  string   `json:"sub"`
 	Role []string `json:"role"`
-	Exp  int64    `json:"exp"`
+	Exp  int64    `json:"exp"` // 必需：无 exp 视为非法（审计 P0-5）
+	Iat  int64    `json:"iat"`
 	Nbf  int64    `json:"nbf"`
 }
 
@@ -130,17 +138,30 @@ func (a *Authenticator) VerifyJWT(token string) (*Claims, error) {
 		return nil, ErrBadFormat
 	}
 	now := time.Now().Unix()
-	if c.Exp > 0 && now > c.Exp {
+	// ⚠️ exp 必须存在：原实现是 `if c.Exp > 0 && now > c.Exp`，于是 exp 缺失的令牌
+	// 被当成「永不过期」接受（实测 200）—— 等于给了一把不能吊销的永久钥匙（审计 P0-5）。
+	if c.Exp == 0 {
+		return nil, ErrNoExpiry
+	}
+	if now > c.Exp {
 		return nil, ErrExpired
 	}
 	if c.Nbf > 0 && now < c.Nbf {
 		return nil, fmt.Errorf("凭证尚未生效")
 	}
+	// 寿命上限只在 iat 存在时可判（JWT 本身不强制 iat）；缺失时无法判断，故只在有 iat 时执行。
+	if c.Iat > 0 && time.Duration(c.Exp-c.Iat)*time.Second > maxTokenLifetime {
+		return nil, ErrTooLongLived
+	}
 	return &c, nil
 }
 
 // SignJWT 造一个 token —— 只给演示/测试用，网关自己不会签发。
+// 未给 iat 时自动补当前时间，这样签出来的令牌也受寿命上限约束。
 func (a *Authenticator) SignJWT(c Claims) string {
+	if c.Iat == 0 {
+		c.Iat = time.Now().Unix()
+	}
 	h, _ := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT"})
 	p, _ := json.Marshal(c)
 	head := base64.RawURLEncoding.EncodeToString(h)
@@ -161,8 +182,13 @@ func Status(err error) int {
 
 // Code 给出与 Status 配套的机器可读错误码。
 func Code(err error) string {
-	if errors.Is(err, ErrForbidden) {
+	switch {
+	case errors.Is(err, ErrForbidden):
 		return "forbidden"
+	case errors.Is(err, ErrNoExpiry):
+		return "token_no_expiry"
+	case errors.Is(err, ErrTooLongLived):
+		return "token_too_long_lived"
 	}
 	return "unauthorized"
 }
