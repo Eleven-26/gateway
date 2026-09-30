@@ -13,19 +13,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"runtime/debug"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gwlab/internal/auth"
 	"gwlab/internal/balancer"
 	"gwlab/internal/breaker"
+	"gwlab/internal/clientip"
 	"gwlab/internal/config"
 	"gwlab/internal/observability"
+	"gwlab/internal/overload"
 	"gwlab/internal/proxy"
 	"gwlab/internal/ratelimit"
 	"gwlab/internal/router"
@@ -39,12 +44,27 @@ const (
 	debugLogTail     = 50      // /debug/logs 返回的条数
 )
 
+// state 是一次配置快照：配置 + 编译好的路由表 + 可信代理 + 鉴权器。
+//
+// 热重载时**整体替换**（`atomic.Pointer`）：请求路径只 `Load()` 一次，既不与重载互相阻塞，
+// 也不用给热路径加锁；同一个请求内的路由/鉴权/选节点一定取自同一份快照。
+type state struct {
+	cfg            *config.Config
+	router         *router.Router
+	trustedProxies []netip.Prefix // 可信代理网段：只有来自这些地址的请求才采信 XFF/X-Real-IP（审计 P1-3）
+	authn          *auth.Authenticator
+}
+
 // Gateway 是实现了 http.Handler 的网关本体。
 type Gateway struct {
-	cfg      *config.Config
-	router   *router.Router
-	authn    *auth.Authenticator
-	limiter  *ratelimit.Limiter
+	st atomic.Pointer[state] // 配置快照：热重载时原子替换（见 Reload）
+
+	rl       ratelimit.Backend // 限流后端：进程内令牌桶，或共享状态服务（审计 C4）
+	bshare   breaker.Store     // 共享熔断状态（审计 C4）；nil = 单副本语义
+	gate     *overload.Gate    // 负载保护闸门（审计 C6）；nil = 不启用
+	tripCh   chan tripEvent    // 本地跳闸的发布队列（有界，满了丢弃并打点）
+	stop     chan struct{}     // 关闭信号：停掉后台同步协程
+	wg       sync.WaitGroup
 	grpcPool *transcode.Pool
 	metrics  *observability.Metrics
 	alog     *observability.AccessLog
@@ -55,29 +75,85 @@ type Gateway struct {
 	proxies   map[string]*proxy.Proxy
 }
 
-// New 装配一个网关。熔断器 / 均衡器 / 代理都是**按需惰性创建**并缓存的。
-func New(cfg *config.Config) (*Gateway, error) {
+// snapshot 取当前配置快照（请求路径上只调一次，后续都用它）。
+func (g *Gateway) snapshot() *state { return g.st.Load() }
+
+// newState 由配置构造一份快照：校验 → 解析可信代理 → 编译路由表 → 构造鉴权器。
+// 任何一步失败都不产生半成品，Reload 靠这一点做到「要么全生效、要么完全不变」。
+func newState(cfg *config.Config) (*state, error) {
+	// 启动/重载即校验（审计 P1-1）：错误配置在启动期暴露，而不是等某个请求打进来变成 500
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("配置校验失败: %w", err)
+	}
+	trusted, err := clientip.ParseTrusted(cfg.TrustedProxies)
+	if err != nil {
+		return nil, fmt.Errorf("TrustedProxies 解析失败: %w", err)
+	}
 	r, err := router.New(cfg.Routes)
 	if err != nil {
 		return nil, err
 	}
-	return &Gateway{
-		cfg:       cfg,
-		router:    r,
-		authn:     auth.New(cfg.JWTSecret, cfg.APIKey),
-		limiter:   ratelimit.NewLimiter(),
+	return &state{
+		cfg:            cfg,
+		router:         r,
+		trustedProxies: trusted,
+		authn:          auth.New(cfg.JWTSecret, cfg.APIKey),
+	}, nil
+}
+
+// New 装配一个网关。熔断器 / 均衡器 / 代理都是**按需惰性创建**并缓存的。
+func New(cfg *config.Config) (*Gateway, error) {
+	st, err := newState(cfg)
+	if err != nil {
+		return nil, err
+	}
+	metrics := observability.NewMetrics()
+	g := &Gateway{
+		// 限流后端按配置选择（审计 C4）：共享状态判定失败要计数，否则 fail-open 会把失效藏起来
+		rl:        newLimitBackend(cfg, func(error) { metrics.IncStateError("ratelimit") }),
 		grpcPool:  transcode.NewPool(),
-		metrics:   observability.NewMetrics(),
+		metrics:   metrics,
 		alog:      observability.NewAccessLog(accessLogKeep),
 		breakers:  map[string]*breaker.Breaker{},
 		balancers: map[string]balancer.Balancer{},
 		proxies:   map[string]*proxy.Proxy{},
-	}, nil
+	}
+	if g.gate = overload.New(cfg.Overload.MaxInflight, cfg.Overload.MaxQueue); g.gate != nil {
+		metrics.AttachOverload(g.gate.Limit(), g.gate.Stats)
+	}
+	g.st.Store(st)
+	g.stop = make(chan struct{})
+	if strings.TrimSpace(cfg.SharedState.URL) != "" {
+		g.startSharedBreaker(cfg, metrics)
+	}
+	return g, nil
 }
 
 // Close 释放网关持有的资源（gRPC 连接池）。
-func (g *Gateway) Close() { g.grpcPool.Close() }
+func (g *Gateway) Close() {
+	if g.stop != nil {
+		close(g.stop) // 先停后台同步（它可能正在用共享状态存储）
+		g.wg.Wait()
+	}
+	g.grpcPool.Close()
+}
 
+// newLimitBackend 按配置选择限流后端（审计 C4）：
+// RateLimit.URL 为空 → 进程内令牌桶（默认，单副本语义）；否则 → 共享状态服务。
+//
+// onErr 在共享后端判定失败（超时/连不上/非 2xx）时被调用，用来打 gw_shared_state_errors_total。
+func newLimitBackend(cfg *config.Config, onErr func(error)) ratelimit.Backend {
+	if strings.TrimSpace(cfg.SharedState.URL) == "" {
+		return ratelimit.NewLocalBackend()
+	}
+	failOpen := true // 默认 fail-open：限流暂时失效，好过把自己的服务打成全量 503
+	if cfg.SharedState.FailOpen != nil {
+		failOpen = *cfg.SharedState.FailOpen
+	}
+	hb := ratelimit.NewHTTPBackend(cfg.RateLimitEndpoint(), time.Duration(cfg.SharedState.Timeout), failOpen)
+	hb.OnError = onErr
+	return hb
+}
 func (g *Gateway) breakerFor(svc *config.Service) *breaker.Breaker {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -85,6 +161,11 @@ func (g *Gateway) breakerFor(svc *config.Service) *breaker.Breaker {
 		return b
 	}
 	b := breaker.New(svc.Breaker)
+	if g.bshare != nil {
+		name := svc.Name
+		// 只在**本地跳闸**时发布（采纳远端状态不回调，否则副本之间会互相转发形成风暴）
+		b.OnTrip = func(until time.Time) { g.publishTrip(name, until) }
+	}
 	g.breakers[svc.Name] = b
 	return b
 }
@@ -144,6 +225,10 @@ func (w *statusWriter) Flush() {
 	}
 }
 
+// Wrote 报告响应是否已经开始写出。重试判定要用它（审计 C3）：任何已经写出字节的失败
+// 都不能再换节点重来 —— 客户端已经收到部分内容，重试只会让响应变成两段拼接。
+func (w *statusWriter) Wrote() bool { return w.wrote }
+
 // Unwrap 让 http.ResponseController 能剥到包装下面的原始 ResponseWriter。
 //
 // ⚠️ 这层不是可选的：ReverseProxy 处理 101 协议升级时走
@@ -175,15 +260,148 @@ func fail(w http.ResponseWriter, status int, code, msg, trace string) {
 }
 
 // ---------------------------------------------------------------------------
-// 主流水线
+// 管理面（独立监听，审计 P1-6）
 // ---------------------------------------------------------------------------
+
+// AdminHandler 返回管理端点的 handler：`/metrics`、`/debug/logs`、`/readyz`。
+//
+// 为什么要独立监听：这三个端点原本排在 ServeHTTP 的**路由与鉴权之前**，任何能访问业务端口的人
+// 都能读到内部状态（上游地址、熔断状态、限流拒绝情况）。拆开之后生产可以只让管理端口绑定
+// 回环或内网；`AdminListenAddr` 留空时才退回「与业务同端口」的老行为。
+func (g *Gateway) AdminHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) { g.handleMetrics(w) })
+	mux.HandleFunc("/debug/logs", func(w http.ResponseWriter, r *http.Request) { g.handleDebugLogs(w) })
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) { g.handleReady(w) })
+	return mux
+}
+
+// handleMetrics 输出 Prometheus 文本：全局指标 + **节点级**指标（审计 B3）。
+func (g *Gateway) handleMetrics(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	_, _ = io.WriteString(w, g.metrics.Render())
+	_, _ = io.WriteString(w, g.nodeMetrics())
+}
+
+// handleDebugLogs 返回内存里最近若干条访问日志。
+func (g *Gateway) handleDebugLogs(w http.ResponseWriter) {
+	writeJSON(w, http.StatusOK, map[string]any{"lines": g.alog.Tail(debugLogTail)})
+}
+
+// handleReady 就绪检查：`/healthz` 只说明「进程活着」，能不能接流量还要看上游是否可用。
+// 判定规则：任一**已被使用过**的服务处于熔断（open / half-open），或该服务所有节点都被摘除 → 503。
+// 还没被请求过的服务不算不健康（均衡器是惰性创建的，没被用过就没有状态）。
+func (g *Gateway) handleReady(w http.ResponseWriter) {
+	type svcState struct {
+		Service   string `json:"service"`
+		Breaker   string `json:"breaker"`
+		Upstreams int    `json:"upstreams"`
+		Ejected   int    `json:"ejected"`
+	}
+
+	g.mu.Lock()
+	states := make([]svcState, 0, len(g.balancers))
+	reasons := []string{}
+	for name, lb := range g.balancers {
+		st := svcState{Service: name}
+		stats := lb.Stats()
+		st.Upstreams = len(stats)
+		for _, s := range stats {
+			if s.Ejected {
+				st.Ejected++
+			}
+		}
+		if cb, ok := g.breakers[name]; ok {
+			bs, _, _ := cb.Snapshot()
+			st.Breaker = bs.String()
+			if bs != breaker.StateClosed {
+				reasons = append(reasons, name+" 熔断状态="+bs.String())
+			}
+		}
+		if st.Upstreams > 0 && st.Ejected == st.Upstreams {
+			reasons = append(reasons, name+" 所有节点都被摘除")
+		}
+		states = append(states, st)
+	}
+	g.mu.Unlock()
+
+	sort.Slice(states, func(i, j int) bool { return states[i].Service < states[j].Service })
+	if len(reasons) > 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "unready", "reasons": reasons, "services": states,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "services": states})
+}
+
+// nodeMetrics 输出节点级指标（审计 B3）：在途、累计失败、是否被摘除。
+//
+// 这些数字来自均衡器的运行时状态，所以**只有被请求过的服务**才会出现（惰性创建）；
+// 服务名排序输出，保证 /metrics 的文本稳定、可 diff、可断言。
+func (g *Gateway) nodeMetrics() string {
+	g.mu.Lock()
+	names := make([]string, 0, len(g.balancers))
+	for name := range g.balancers {
+		names = append(names, name)
+	}
+	g.mu.Unlock()
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	b.WriteString("# HELP gw_upstream_inflight 每个上游节点的在途请求数\n")
+	b.WriteString("# TYPE gw_upstream_inflight gauge\n")
+	type row struct {
+		svc  string
+		stat balancer.NodeStat
+	}
+	var rows []row
+	g.mu.Lock()
+	for _, name := range names {
+		for _, s := range g.balancers[name].Stats() {
+			rows = append(rows, row{svc: name, stat: s})
+		}
+	}
+	g.mu.Unlock()
+	for _, r := range rows {
+		fmt.Fprintf(&b, "gw_upstream_inflight{service=%q,addr=%q} %d\n", r.svc, r.stat.Addr, r.stat.InFlight)
+	}
+	b.WriteString("# HELP gw_upstream_failures_total 每个上游节点的累计失败数（被动摘除的原始计数）\n")
+	b.WriteString("# TYPE gw_upstream_failures_total counter\n")
+	for _, r := range rows {
+		fmt.Fprintf(&b, "gw_upstream_failures_total{service=%q,addr=%q} %d\n", r.svc, r.stat.Addr, r.stat.Failures)
+	}
+	b.WriteString("# HELP gw_upstream_ejected 每个上游节点当前是否被摘除（1=已摘除，正在冷却或探测）\n")
+	b.WriteString("# TYPE gw_upstream_ejected gauge\n")
+	for _, r := range rows {
+		v := 0
+		if r.stat.Ejected {
+			v = 1
+		}
+		fmt.Fprintf(&b, "gw_upstream_ejected{service=%q,addr=%q} %d\n", r.svc, r.stat.Addr, v)
+	}
+	return b.String()
+}
 
 // ServeHTTP 是网关的请求入口。
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	traceID := observability.EnsureTraceID(r.Header)
+	// 链路上下文（审计 C5）：优先 W3C traceparent，其次兼容 X-Trace-Id，都没有就新生成；
+	// 并为本跳生成 span-id。放进 ctx 是为了让 proxy.Director 能写出正确的 traceparent。
+	tr := observability.StartTrace(r.Header)
+	traceID := tr.TraceID
+	r = r.WithContext(observability.WithTrace(r.Context(), tr))
 	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-	entry := observability.Entry{TraceID: traceID, Method: r.Method, Path: r.URL.Path, Host: r.Host}
+	entry := observability.Entry{TraceID: traceID, SpanID: tr.SpanID, Method: r.Method, Path: r.URL.Path, Host: r.Host}
+	// 整个请求共用这一份快照：热重载只换指针，不会出现「路由用新配置、选节点用旧配置」
+	snap := g.snapshot()
+	// 真实客户端 IP：只有直连对端本身是可信代理时才采信 XFF / X-Real-IP（审计 P1-3）。
+	// 只解析一次，限流、日志与「哈希键回落」三处共用，避免口径不一致。
+	clientIP := clientip.Resolve(r.RemoteAddr, r.Header, snap.trustedProxies)
+	entry.ClientIP = clientIP
 
 	g.metrics.IncInflight(1)
 
@@ -218,19 +436,24 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// ===== 网关自身的端点：不经过路由与鉴权 =====
-	switch r.URL.Path {
-	case "/metrics":
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		_, _ = w.Write([]byte(g.metrics.Render()))
-		return
-	case "/debug/logs":
-		writeJSON(sw, http.StatusOK, map[string]any{"lines": g.alog.Tail(debugLogTail)})
-		return
+	// ===== 管理端点：默认走独立监听的 AdminHandler（审计 P1-6）；
+	//        只有配置里没给 AdminListenAddr 时才退回业务端口 =====
+	if snap.cfg.AdminListenAddr == "" {
+		switch r.URL.Path {
+		case "/metrics":
+			g.handleMetrics(sw)
+			return
+		case "/debug/logs":
+			g.handleDebugLogs(sw)
+			return
+		case "/readyz":
+			g.handleReady(sw)
+			return
+		}
 	}
 
 	// ===== ① 路由匹配 =====
-	m, ok := g.router.Match(r)
+	m, ok := snap.router.Match(r)
 	if !ok {
 		entry.Route = "unmatched"
 		fail(sw, http.StatusNotFound, "route_not_found", "没有匹配的路由", traceID)
@@ -255,8 +478,36 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ===== 负载保护（审计 C6）：并发上限 + 有界排队 =====
+	// 位置刻意选在**路由与 self 之后、鉴权之前**：
+	//   - self 路由（/healthz）不参与保护 —— 负载高时把健康检查也拒了，LB 会把实例摘掉，
+	//     剩下来的实例压力更大，反而加速雪崩；
+	//   - 鉴权/限流/转码/反代才是真正吃资源的部分，闸门放在它们前面就够了。
+	if g.gate != nil {
+		queueTO := time.Duration(snap.cfg.Overload.QueueTimeout)
+		if queueTO <= 0 {
+			queueTO = time.Second
+		}
+		retryAfter := time.Duration(snap.cfg.Overload.RetryAfter)
+		if retryAfter <= 0 {
+			retryAfter = time.Second
+		}
+		qctx, cancelQueue := context.WithTimeout(r.Context(), queueTO)
+		release, reason, qerr := g.gate.Acquire(qctx)
+		cancelQueue() // 排队结束就撤掉这个 ctx（后面的转发用自己的超时）
+		if qerr != nil {
+			entry.Err = "overload:" + string(reason)
+			g.metrics.IncOverload(m.Route.Name)
+			sw.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+			sw.Header().Set("X-Load-Shed", string(reason))
+			fail(sw, http.StatusServiceUnavailable, "overloaded", "网关过载，请稍后重试", traceID)
+			return
+		}
+		defer release() // 必须归还：漏一次就永久少一个并发额度
+	}
+
 	// ===== ② 鉴权 =====
-	identity, err := g.authn.Authenticate(r, m.Route.Auth)
+	identity, err := snap.authn.Authenticate(r, m.Route.Auth)
 	if err != nil {
 		entry.Err = err.Error()
 		fail(sw, auth.Status(err), auth.Code(err), err.Error(), traceID)
@@ -267,8 +518,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// ===== ③ 限流（在鉴权之后，才能按用户维度限）=====
 	if p := m.Route.Limit; p.RatePerSec > 0 {
-		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-		if allow, retry := g.limiter.Bucket(ratelimit.Key(m.Route.Name, identity.Subject, ip), p).Allow(1); !allow {
+		if allow, retry := g.rl.Allow(ratelimit.Key(m.Route.Name, identity.Subject, clientIP), p); !allow {
 			entry.LimitHit = true
 			g.metrics.IncLimit(m.Route.Name)
 			sw.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
@@ -278,7 +528,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	svc := g.cfg.Service(m.Route.Upstream)
+	svc := snap.cfg.Service(m.Route.Upstream)
 	if svc == nil {
 		fail(sw, http.StatusInternalServerError, "bad_config", "上游 "+m.Route.Upstream+" 未定义", traceID)
 		return
@@ -296,55 +546,132 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	st, _, _ := cb.Snapshot()
 	entry.BreakerSt = st.String()
 
-	// ===== ④ 选节点 =====
+	// Allow 与 Report 必须成对（审计 P2-6）：下面还要经过动态选节点与两条分支，
+	// 任何提前 return（乃至 panic）都该算作「这次调用没成功」，用 defer 兜住 ——
+	// 否则半开状态的探测槽位会泄漏，恢复流程可能被永久卡住。
+	breakerReported := false
+	defer func() {
+		if !breakerReported {
+			cb.Report(false)
+		}
+	}()
+
+	// ===== ④ 选节点 → ⑤ 协议转换 / ⑥ 反向代理（可重试，审计 C3）=====
 	lb := g.balancerFor(svc)
 	hashKey := ""
 	if svc.HashKeyFrom != "" {
 		hashKey = r.Header.Get(svc.HashKeyFrom)
 	}
 	if hashKey == "" {
-		hashKey, _, _ = net.SplitHostPort(r.RemoteAddr)
+		hashKey = clientIP
 	}
-	up, err := lb.Pick(hashKey)
-	if err != nil {
-		entry.Err = err.Error()
-		fail(sw, http.StatusServiceUnavailable, "no_upstream", err.Error(), traceID)
-		return
+
+	// 请求级总预算：每路由超时优先，其次是服务超时。所有尝试都挂在这个 ctx 下，
+	// 所以"重试把总耗时拖长"是有限度的（PerTryTimeout 只是把总预算再切细）。
+	total := svc.Timeout
+	if m.Route.Timeout > 0 {
+		total = time.Duration(m.Route.Timeout)
 	}
-	entry.Upstream = up.Addr
-	// ④ 的收尾：Pick 与 Done 必须成对 —— `least_conn` 完全靠这对调用维护「在途请求数」，
-	// 只 Pick 不 Done 的话计数只增不减，节点会被永久判定为「最忙」（AGENTS.md §5 记录过这个缺口）。
-	// 用 defer 而不是在两条分支里各写一次：下面 ⑤ 协议转换与 ⑥ 反向代理是互斥分支，
-	// 各自都可能在中间提前 return，只有 defer 能保证「有借必有还」。
-	defer lb.Done(up.Addr)
+	reqCtx, cancelAll := context.WithTimeout(r.Context(), total)
+	defer cancelAll()
 
-	// ===== ⑤ 协议转换 / ⑥ 反向代理 =====
-	ctx, cancel := context.WithTimeout(r.Context(), svc.Timeout)
-	defer cancel()
+	plan := planRetry(m.Route, r)
 
+	// 上游往返耗时（审计 B8）：覆盖所有尝试，收口时写进访问日志的 upstream_ms
+	upstreamStart := time.Now()
+	defer func() { entry.UpstreamMs = time.Since(upstreamStart).Milliseconds() }()
+
+	// 协议转换要读请求体：**在循环外读一次**（循环里读的话第二次尝试就只能拿到空 body）
+	var grpcBody []byte
 	if m.Route.Transcode != nil {
-		body, _ := io.ReadAll(io.LimitReader(r.Body, maxTranscodeBody))
+		grpcBody, _ = io.ReadAll(io.LimitReader(r.Body, maxTranscodeBody))
 		_ = r.Body.Close()
+	}
 
-		out, err := transcode.Transcode(ctx, g.grpcPool, up.Addr, m.Route.Transcode, body, m.Groups,
-			map[string]string{observability.TraceHeader: traceID, "x-user-id": identity.Subject})
-		if err != nil {
-			entry.Err = "grpc:" + err.Error()
-			cb.Report(false)
-			fail(sw, http.StatusBadGateway, "grpc_error", err.Error(), traceID)
+	// baseReq 保留"没挂过任何 per-attempt ctx"的请求：每次尝试都从它派生，
+	// 避免 ctx 在重试之间层层嵌套。
+	baseReq := r
+
+	for attempt := 0; attempt < plan.attempts; attempt++ {
+		up, perr := lb.Pick(hashKey)
+		if perr != nil {
+			entry.Err = perr.Error()
+			fail(sw, http.StatusServiceUnavailable, "no_upstream", perr.Error(), traceID)
 			return
 		}
-		cb.Report(true)
-		writeJSON(sw, http.StatusOK, map[string]any{"code": 0, "data": out, "trace": traceID, "via": "grpc"})
-		return
-	}
+		entry.Upstream = up.Addr
 
-	// 反向代理路径：把带超时的 ctx 写回请求后交给 ReverseProxy
-	r = r.WithContext(ctx)
-	g.proxyFor(svc, up, m.Route.StripPrefix).ServeHTTP(sw, r)
-	cb.Report(sw.status < 500) // 5xx 视为「上游不健康」
-	if st, _, _ := cb.Snapshot(); st != breaker.StateClosed && entry.BreakerSt == breaker.StateClosed.String() {
-		entry.BreakerSt = st.String()
-		g.metrics.IncTrip(svc.Name)
+		// 单次尝试在闭包里跑：Pick/Done 必须严格配对（least_conn 靠它维护在途数），
+		// 而 defer 在循环里只会在函数返回时执行 —— 所以用闭包把作用域收窄。
+		committed, attemptErr, healthy := func() (bool, string, bool) {
+			defer lb.Done(up.Addr)
+
+			attemptCtx, cancelAttempt := reqCtx, context.CancelFunc(func() {})
+			if m.Route.Retry != nil && m.Route.Retry.PerTryTimeout > 0 {
+				attemptCtx, cancelAttempt = context.WithTimeout(reqCtx, time.Duration(m.Route.Retry.PerTryTimeout))
+			}
+			defer cancelAttempt()
+
+			// ErrHolder 让上游错误能被读出来（context 才能穿过 ReverseProxy 的 Clone）
+			req := proxy.WithErrHolder(baseReq.WithContext(attemptCtx))
+			if plan.deferErr {
+				req = proxy.WithDeferredError(req) // 还有重试机会：先别写 502
+			}
+			// 回写外层 r：收口那段 defer 读的是它，ErrHolder 不在原始请求上就读不到错误
+			r = req
+
+			if m.Route.Transcode != nil {
+				out, terr := transcode.Transcode(attemptCtx, g.grpcPool, up, m.Route.Transcode, grpcBody, m.Groups,
+					map[string]string{observability.TraceHeader: traceID, "x-user-id": identity.Subject})
+				if terr != nil {
+					// gRPC 失败同样是"一个字节都没写出去"，所以也可以重试
+					return false, "grpc:" + terr.Error(), false
+				}
+				writeJSON(sw, http.StatusOK, map[string]any{"code": 0, "data": out, "trace": traceID, "via": "grpc"})
+				return true, "", true
+			}
+
+			g.proxyFor(svc, up, m.Route.StripPrefix).ServeHTTP(sw, req)
+			if sw.wrote {
+				// 响应已经写出（正常响应，或响应中途失败后 ErrorHandler 补的 5xx）：不能再重试
+				return true, proxy.ErrFrom(req), sw.status < 500
+			}
+			return false, proxy.ErrFrom(req), false
+		}()
+
+		if committed {
+			breakerReported = true
+			cb.Report(healthy)
+			lb.Report(up.Addr, healthy) // 节点级被动摘除：连续失败到阈值就摘掉这个地址（审计 P1-2）
+			if st, _, _ := cb.Snapshot(); st != breaker.StateClosed && entry.BreakerSt == breaker.StateClosed.String() {
+				entry.BreakerSt = st.String()
+				g.metrics.IncTrip(svc.Name)
+			}
+			// 这次成功是"重试换节点"换来的：把上一次的错误标成重试痕迹，
+			// 免得日志里出现 `status=200` 却带 `err=` 的迷惑组合（审计 C3）。
+			if attempt > 0 && entry.Err != "" {
+				entry.Err = "retried(" + entry.Err + ")"
+			}
+			return
+		}
+
+		// 一个字节都没写出去 → 这次尝试彻底失败。节点级上报失败，然后看还能不能再试。
+		lb.Report(up.Addr, false)
+		if attemptErr == "" {
+			attemptErr = "upstream error"
+		}
+		entry.Err = attemptErr
+		if attempt < plan.attempts-1 && reqCtx.Err() == nil {
+			continue // 换一个节点（Pick 会把刚才失败的算进去，天然分散）
+		}
+
+		breakerReported = true
+		cb.Report(false)
+		status := http.StatusBadGateway
+		if strings.Contains(attemptErr, "timeout") {
+			status = http.StatusGatewayTimeout
+		}
+		fail(sw, status, "upstream_error", attemptErr, traceID)
+		return
 	}
 }

@@ -73,3 +73,42 @@ func TestAuthenticateAPIKey(t *testing.T) {
 		t.Errorf("身份 = %q，期望 apikey:ak_test", id.Subject)
 	}
 }
+
+// TestAuthenticateBearerSchemeCaseInsensitive 盯住 auth-scheme 大小写不敏感（审计 P2-1）：
+// RFC 7235 §2.1 规定 scheme 大小写不敏感，但原实现是 strings.CutPrefix(raw, "Bearer ")，
+// 逐字节比较，于是实测 `bearer <合法token>` 被答成 401「凭证格式错误」。
+func TestAuthenticateBearerSchemeCaseInsensitive(t *testing.T) {
+	a := New("test-secret", "test-key")
+	policy := config.AuthPolicy{Required: true, Scheme: "jwt"}
+	now := time.Now().Unix()
+	token := a.SignJWT(Claims{Sub: "u", Iat: now, Exp: now + 60})
+
+	cases := []struct {
+		name   string
+		header string
+		want   error // nil 表示应当通过
+	}{
+		{"标准写法 Bearer", "Bearer " + token, nil},
+		{"小写 bearer 必须通过", "bearer " + token, nil},
+		{"全大写 BEARER 必须通过", "BEARER " + token, nil},
+		{"混合大小写 BeArEr 必须通过", "BeArEr " + token, nil},
+		{"别的 scheme（Token）必须被拒", "Token " + token, ErrBadFormat},
+		{"裸 token（无 scheme）必须被拒", token, ErrBadFormat},
+		{"用 Tab 分隔也必须被拒（只接受空格）", "Bearer\t" + token, ErrBadFormat},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("Authorization", tc.header)
+			id, err := a.Authenticate(req, policy)
+			switch {
+			case tc.want == nil && err != nil:
+				t.Fatalf("期望通过，实际 %v", err)
+			case tc.want == nil && (id == nil || id.Subject != "u"):
+				t.Fatalf("身份 = %+v，期望 Subject=u", id)
+			case tc.want != nil && !errors.Is(err, tc.want):
+				t.Fatalf("期望 %v，实际 %v", tc.want, err)
+			}
+		})
+	}
+}

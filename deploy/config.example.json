@@ -1,0 +1,131 @@
+{
+  "_说明": [
+    "gateway 的外部配置模板（JSON）。用法：GW_CONFIG=/path/to/this.json（或下面的环境变量覆盖）。",
+    "语义：本文件是**覆盖**而不是合并 —— 写了 routes / services 就整体替换内置默认值。",
+    "只写你要改的字段即可；没写的字段沿用 internal/config 里的 Default()。",
+    "时长写成字符串（\"2s\" / \"500ms\"），字段名是 snake_case；写错字段名会**启动失败**（这是特性）。",
+    "环境变量优先级最高：GW_LISTEN_ADDR / GW_ADMIN_LISTEN_ADDR / GW_JWT_SECRET / GW_API_KEY / GW_TRUSTED_PROXIES。",
+    "热重载：进程每 3 秒看一次本文件的 mtime，变了就重新加载；失败时保留旧配置并打日志。"
+  ],
+
+  "listen_addr": "127.0.0.1:18080",
+  "admin_listen_addr": "127.0.0.1:18081",
+
+  "jwt_secret": "PUT-IN-ENV-GW_JWT_SECRET",
+  "api_key": "PUT-IN-ENV-GW_API_KEY",
+
+  "trusted_proxies": ["10.0.0.0/8", "127.0.0.1/32"],
+
+  "_shared_state_说明": [
+    "共享状态服务（审计 C4）：限流桶与熔断状态跨副本共享。留空 = 全在进程内（单副本语义）。",
+    "多副本下不共享的后果：①限流实际放行量 = 副本数 × 阈值；②A 副本已熔断的服务，B 副本还在打流量。",
+    "参考实现：go run ./cmd/statestore -listen 127.0.0.1:18090",
+    "端点：POST /ratelimit、POST+GET /breaker。读不到时降级（限流按 fail_open，熔断退回本地状态机）并计入 gw_shared_state_errors_total。"
+  ],
+  "shared_state": {
+    "url": "http://127.0.0.1:18090",
+    "timeout": "200ms",
+    "fail_open": true,
+    "sync_interval": "1s"
+  },
+
+  "services": {
+    "order-svc": {
+      "name": "order-svc",
+      "balance": "round_robin",
+      "upstreams": [
+        { "addr": "10.0.0.11:8080", "weight": 3, "backend": 1 },
+        { "addr": "10.0.0.12:8080", "weight": 1, "backend": 2 }
+      ],
+      "timeout": "2s",
+      "breaker": {
+        "window_size": 10,
+        "fail_ratio": 0.5,
+        "min_requests": 4,
+        "open_for": "3s",
+        "half_open_max": 2
+      },
+      "ejection": {
+        "fail_threshold": 3,
+        "cooldown": "5s"
+      }
+    },
+    "grpc-order-svc": {
+      "name": "grpc-order-svc",
+      "balance": "round_robin",
+      "upstreams": [{ "addr": "10.0.0.21:9000", "grpc": true }],
+      "timeout": "3s",
+      "breaker": { "window_size": 10, "fail_ratio": 0.5, "min_requests": 4, "open_for": "3s", "half_open_max": 2 }
+    },
+    "payment-svc": {
+      "_说明": [
+        "上游 TLS（批次 C2）：scheme=https 时按 tls 参数连接；不写 scheme 就是明文 http。",
+        "证书文件在**启动期**就会被读出来解析：路径写错 / 证书与私钥不匹配 → 进程起不来（这是特性）。",
+        "下面用 insecure_skip_verify 让这份示例**开箱即可加载**（不需要真证书）。",
+        "生产应当这样写（把路径换成真实文件）：",
+        "  \"tls\": { \"ca_file\": \"/etc/gateway/certs/internal-ca.pem\",",
+        "             \"server_name\": \"pay.internal\",",
+        "             \"client_cert_file\": \"/etc/gateway/certs/gateway-client.pem\",",
+        "             \"client_key_file\": \"/etc/gateway/certs/gateway-client.key\" }",
+        "⚠️ insecure_skip_verify 关掉的是证书链与主机名校验，等于给中间人开门，只应临时调试。"
+      ],
+      "name": "payment-svc",
+      "balance": "round_robin",
+      "upstreams": [
+        {
+          "addr": "pay.internal:8443",
+          "scheme": "https",
+          "tls": {
+            "_说明": "用 IP 直连而证书签的是域名时，server_name（SNI）必须写证书上的域名，否则握手失败",
+            "server_name": "pay.internal",
+            "insecure_skip_verify": true
+          }
+        }
+      ],
+      "timeout": "5s",
+      "breaker": { "window_size": 10, "fail_ratio": 0.5, "min_requests": 4, "open_for": "3s", "half_open_max": 2 },
+      "ejection": { "fail_threshold": 3, "cooldown": "5s" }
+    }
+  },
+
+  "routes": [
+    {
+      "name": "order-list",
+      "host": "api.example.com",
+      "path": "/api/order/list",
+      "path_type": "exact",
+      "methods": ["GET"],
+      "upstream": "order-svc",
+      "limit": { "rate_per_sec": 50, "burst": 10 }
+    },
+    {
+      "name": "order-prefix",
+      "host": "api.example.com",
+      "path": "/api/order/",
+      "path_type": "prefix",
+      "strip_prefix": "/api",
+      "upstream": "order-svc",
+      "auth": { "required": true, "scheme": "jwt" },
+      "limit": { "rate_per_sec": 20, "burst": 5 }
+    },
+    {
+      "name": "order-create",
+      "host": "*",
+      "path": "/api/orders",
+      "path_type": "exact",
+      "methods": ["POST"],
+      "upstream": "grpc-order-svc",
+      "auth": { "required": true, "scheme": "jwt", "roles": ["admin", "user"] },
+      "transcode": { "service": "order.OrderService", "method": "CreateOrder" }
+    },
+    {
+      "name": "payment-create",
+      "host": "*",
+      "path": "/api/payment",
+      "path_type": "exact",
+      "methods": ["POST"],
+      "upstream": "payment-svc",
+      "auth": { "required": true, "scheme": "jwt", "roles": ["admin"] }
+    }
+  ]
+}

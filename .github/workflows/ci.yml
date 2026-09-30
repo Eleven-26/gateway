@@ -1,0 +1,45 @@
+# CI：本机（Windows）跑不了 `go test -race`（CGO_ENABLED=0 且无 gcc，见 AGENTS.md §3），
+# 所以竞态检测只在 Linux runner 上做；同时把 gofmt / vet / 全量测试与三个入口的构建都钉住。
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod # 版本以 go.mod 为准，避免两处各写一遍
+          cache: true
+
+      # gofmt：有未格式化的文件就失败（本地 `make fmt` 可修）
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未格式化，请跑 make fmt："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race 需要 cgo：Linux runner 默认可开，这正是本机缺的那一块
+      - name: go test -race
+        run: go test -race ./... -count=1
+
+      - name: build 三个入口
+        run: |
+          go build -o bin/gateway ./cmd/gateway
+          go build -o bin/backend ./cmd/backend
+          go build -o bin/hashring ./cmd/hashring
+
+      # 基准与容量相关：不设阈值（机器差异大），但把数字留在日志里便于对比
+      - name: benchmark（仅记录）
+        run: go test ./internal/router/ ./internal/balancer/ -run XXX -bench . -benchtime 200ms -count=1

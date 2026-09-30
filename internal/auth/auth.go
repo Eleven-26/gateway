@@ -76,8 +76,12 @@ func (a *Authenticator) Authenticate(r *http.Request, p config.AuthPolicy) (*Ide
 		if raw == "" {
 			return nil, ErrNoCredential
 		}
-		token, ok := strings.CutPrefix(raw, "Bearer ")
-		if !ok {
+		// auth-scheme 大小写不敏感（RFC 7235 §2.1）：原实现 strings.CutPrefix(raw, "Bearer ")
+		// 是逐字节比较，于是 `bearer xxx` / `BEARER xxx` 被判成「凭证格式错误」而 401
+		//（实测踩过，审计 P2-1）。这里只对 scheme 做 EqualFold，分隔符仍严格要求空格，
+		// 所以 `Token xxx` 这类别的 scheme 依旧被拒。
+		scheme, token, ok := strings.Cut(raw, " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") {
 			return nil, ErrBadFormat
 		}
 		claims, err := a.VerifyJWT(strings.TrimSpace(token))

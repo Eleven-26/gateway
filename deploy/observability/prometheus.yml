@@ -1,0 +1,21 @@
+# Prometheus 抓取配置：只抓管理端口的 /metrics（业务端口从批次 B4 起不再提供）。
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: gateway
+    metrics_path: /metrics
+    static_configs:
+      # host 网络模式（Docker Desktop / Linux）下用 127.0.0.1；
+      # bridge 网络或 k8s 里改成服务名，例如 gateway:18081 / gateway-admin.monitoring.svc:18081
+      - targets: ["127.0.0.1:18081"]
+        labels:
+          instance: gateway-local
+
+# 值得配告警的指标（阈值按业务定，这里只记录语义）：
+#   gw_breaker_trips_total{service}   熔断器打开次数 —— 短时间增长说明上游在抖
+#   gw_upstream_ejected{service,addr} 节点被摘除 —— 持续为 1 说明某个节点真的坏了
+#   gw_limit_rejected_total{route}    限流拒绝 —— 突增说明被压或阈值太小
+#   gw_panics_total                   兜底捕获的 panic —— 只要 > 0 就该有人看
+#   gw_request_duration_ms{quantile}  分位（手写样本，跨实例不可聚合，多副本需换直方图）

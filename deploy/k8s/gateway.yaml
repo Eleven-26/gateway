@@ -1,0 +1,162 @@
+# 网关的 k8s 清单：Deployment + 业务/管理两个 Service + Ingress + PDB + 管理面 NetworkPolicy。
+#
+# 用法：
+#   kubectl apply -f deploy/k8s/gateway.yaml
+#   kubectl apply -f deploy/k8s/servicemonitor.yaml   # 可选，需要 Prometheus Operator CRD
+#
+# ⚠️ 两个与代码强相关的约束，别照抄改坏：
+#   1. `replicas: 1` —— 限流桶、熔断器、节点摘除状态**都在进程内**（AGENTS.md §5）。
+#      多副本会让限流阈值变成 N 倍、熔断与摘除各算各的；要扩副本必须先做 C4（共享状态）。
+#   2. readiness 用**管理端口**的 `/readyz`（它会检查熔断状态与"所有节点是否被摘除"），
+#      liveness 用业务端口的 `/healthz`（只代表进程活着）。两者语义不同，别混用。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  labels:
+    app: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532 # distroless nonroot
+        readOnlyRootFilesystem: true
+      containers:
+        - name: gateway
+          image: gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 18080
+            - name: admin
+              containerPort: 18081
+          env:
+            # 批次 C1（配置外置）已落地：这两个注入点会把监听地址改到 0.0.0.0，
+            # 否则容器里绑的是源码默认的 127.0.0.1，Service 转发不到。
+            - name: GW_LISTEN_ADDR
+              value: "0.0.0.0:18080"
+            - name: GW_ADMIN_LISTEN_ADDR
+              value: "0.0.0.0:18081"
+            # 也可以挂一份 JSON 配置（覆盖语义：只写要改的字段）：
+            #   GW_CONFIG: /etc/gateway/config.json  + 下面 volumes 挂 ConfigMap
+            # 网关在 LB/Ingress 后面时必填：只有来自这些网段的请求才采信 XFF / X-Real-IP
+            # （批次 B5 的 clientip；留空表示谁都不信，限流维度会退化成 Ingress 的地址）
+            - name: GW_TRUSTED_PROXIES
+              value: "10.0.0.0/8"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+---
+# 业务入口：只暴露 18080
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  labels:
+    app: gateway
+spec:
+  selector:
+    app: gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# 管理端点：**不要**挂 Ingress、不要开 NodePort —— /metrics、/debug/logs 没有鉴权（AGENTS.md §4）。
+# 集群内抓取用这个 ClusterIP，再用下面的 NetworkPolicy 限定来源。
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-admin
+  labels:
+    app: gateway
+    role: admin
+spec:
+  selector:
+    app: gateway
+  ports:
+    - name: admin
+      port: 18081
+      targetPort: admin
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-admin-restricted
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    # 业务端口：谁都能进（真实环境通常由 Ingress 控制）
+    - ports:
+        - port: http
+          protocol: TCP
+    # 管理端口：只允许监控命名空间访问
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: admin
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gateway
+  annotations:
+    # 与网关自己的请求体上限对齐（maxBodyBytes = 8MB，超限返回 413）
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+spec:
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 80
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: gateway

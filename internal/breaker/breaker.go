@@ -63,6 +63,45 @@ type Breaker struct {
 
 	// 观测用
 	lastTrip time.Time
+
+	// OnTrip 在**本地**跳闸（不是采纳远端状态）时被调用，参数是"打开到什么时候"。
+	// 多副本部署时由 gateway 接上共享状态存储，把这次跳闸发布出去（审计 C4）。
+	// ⚠️ 只有一个方向：本地跳闸 → 发布。采纳远端状态时**不**回调，否则两个副本会互相
+	// 转发同一件事，形成发布风暴（A 发布 → B 采纳 → B 又发布 → A 采纳 → …）。
+	OnTrip func(until time.Time)
+}
+
+// OpenUntil 返回"当前打开到什么时候"；未打开时返回零值。
+// 多副本部署时用它把状态发布出去（审计 C4）。
+func (b *Breaker) OpenUntil() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state != StateOpen {
+		return time.Time{}
+	}
+	return b.openedAt.Add(b.cfg.OpenFor)
+}
+
+// ForceOpenUntil 采纳远端决定的打开状态：在 until 之前一律快速失败（审计 C4）。
+//
+// 实现方式是把 openedAt 往回拨到 `until - OpenFor`，这样：
+//   - 现在 < until 时，冷却判断 `since(openedAt) < OpenFor` 成立 → 继续拒绝；
+//   - 到了 until，冷却自然到期 → 进入半开，按正常的单探测流程恢复。
+//
+// 这样"远端打开"与"本地打开"共用同一套恢复逻辑，不需要第二套状态机（少一套状态就少一类 bug）。
+// 若本地已经是打开状态且时间更晚，则不改（就晚不就早）。
+func (b *Breaker) ForceOpenUntil(until time.Time) {
+	if until.IsZero() {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == StateOpen && !b.openedAt.Add(b.cfg.OpenFor).Before(until) {
+		return // 本地已经打开到更晚，不用缩短
+	}
+	b.state = StateOpen
+	b.openedAt = until.Add(-b.cfg.OpenFor)
+	b.halfInFlight, b.halfOK = 0, 0
 }
 
 // New 构造熔断器。WindowSize / OpenFor / HalfOpenMax 为零时取默认值；
@@ -108,7 +147,21 @@ func (b *Breaker) Allow() error {
 }
 
 // Report 上报这次调用结果。
+//
+// ⚠️ OnTrip 回调在**释放锁之后**才触发（见下面 report 的拆分）：跳闸往往要通知别的副本，
+// 而在持锁时做网络 IO 会把该服务的所有请求一起卡住 —— 这类"持锁回调"是并发代码里
+// 最隐蔽的故障源之一，所以宁可多拆一个函数。
 func (b *Breaker) Report(success bool) {
+	trip := b.report(success)
+	if !trip.IsZero() {
+		if cb := b.OnTrip; cb != nil {
+			cb(trip)
+		}
+	}
+}
+
+// report 在锁内完成状态迁移；若本次**本地跳闸**，返回"打开到什么时候"（否则零值）。
+func (b *Breaker) report(success bool) time.Time {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -119,14 +172,13 @@ func (b *Breaker) Report(success bool) {
 			b.halfInFlight--
 		}
 		if !success {
-			b.toOpenLocked()
-			return
+			return b.toOpenLocked()
 		}
 		b.halfOK++
 		if b.halfOK >= b.cfg.HalfOpenMax {
 			b.toClosedLocked()
 		}
-		return
+		return time.Time{}
 	}
 
 	// closed：滑动窗口统计
@@ -141,13 +193,19 @@ func (b *Breaker) Report(success bool) {
 	if b.filled < len(b.window) {
 		b.filled++
 	}
-	// ③ 样本足够且失败率超阈值才打开
-	if b.filled >= b.cfg.MinRequests && b.filled > 0 {
+	// ③ 样本足够、**确实有过失败**、且失败率超阈值才打开。
+	//
+	// ⚠️ `b.failures > 0` 这一条不能省：`FailRatio` 的零值语义是"任何失败率都达阈值"，
+	// 而**零失败时 ratio = 0 >= 0 也成立** —— 少了这个判断，一个**成功的**请求都会把熔断器
+	// 打开（本机实测踩到：没配 breaker 的服务，第一次成功请求后 `breaker=open`，
+	// 随后正常流量全被 503 快速失败，而且每次半开探测成功又会立刻被下一次成功请求重新打开）。
+	if b.failures > 0 && b.filled >= b.cfg.MinRequests && b.filled > 0 {
 		ratio := float64(b.failures) / float64(b.filled)
 		if ratio >= b.cfg.FailRatio {
-			b.toOpenLocked()
+			return b.toOpenLocked()
 		}
 	}
+	return time.Time{}
 }
 
 // Snapshot 返回 (状态, 窗口内失败数, 窗口内样本数)，给指标与日志用。
@@ -157,11 +215,12 @@ func (b *Breaker) Snapshot() (State, int, int) {
 	return b.state, b.failures, b.filled
 }
 
-func (b *Breaker) toOpenLocked() {
+func (b *Breaker) toOpenLocked() time.Time {
 	b.state = StateOpen
 	b.openedAt = time.Now()
 	b.lastTrip = b.openedAt
 	b.halfInFlight, b.halfOK = 0, 0
+	return b.openedAt.Add(b.cfg.OpenFor)
 }
 
 func (b *Breaker) toHalfOpenLocked() {

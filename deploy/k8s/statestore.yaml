@@ -1,0 +1,90 @@
+# 共享状态服务（限流桶 + 熔断打开状态）—— 只在需要**多副本**时才部署（审计 C4）。
+#
+# 为什么需要它：网关的限流桶与熔断器默认都在进程内 —— 多副本时限流实际放行量变成
+# 「副本数 × 阈值」，熔断则是各副本各学各的（A 熔断了、B 还在打流量）。
+#
+# ⚠️ 它本身是新的单点，三条注意：
+#   1. **单副本**：本参考实现的状态在内存里，多副本之间不共享（那等于没解决原问题）；
+#      要横向扩展得把存储换成共享介质（Redis/etcd/DB），或按 key 一致性哈希分片；
+#   2. 重启会丢状态（限流短暂放宽、熔断重置）——比"重启后永久拒绝"安全，但要知情；
+#   3. **不要暴露到集群外**：它没有任何鉴权（只应被网关与监控访问）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: statestore
+  labels:
+    app: statestore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: statestore
+  template:
+    metadata:
+      labels:
+        app: statestore
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        readOnlyRootFilesystem: true
+      containers:
+        - name: statestore
+          image: gateway:latest # 与网关同一个镜像，command 覆盖即可
+          command: ["/app/statestore"]
+          args: ["-listen", "0.0.0.0:18090"]
+          ports:
+            - name: state
+              containerPort: 18090
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: state
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: state
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: statestore
+  labels:
+    app: statestore
+spec:
+  selector:
+    app: statestore
+  ports:
+    - name: state
+      port: 18090
+      targetPort: state
+---
+# 只允许网关访问它（它没有鉴权，且是自己的单点，被别人扫到就是白送一个放大面）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: statestore-gateway-only
+spec:
+  podSelector:
+    matchLabels:
+      app: statestore
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - port: state
+          protocol: TCP

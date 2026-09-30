@@ -1,0 +1,148 @@
+{
+  "__comment": "gateway 的运行看板：请求/延迟/限流/熔断/节点摘除/panic 六组。数据源用 Prometheus（抓管理端口 18081 的 /metrics）。导入方式：Grafana → Dashboards → Import → 粘贴本文件。",
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "title": "RPS（按路由与状态码）",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (route, status) (rate(gw_requests_total[1m]))",
+          "legendFormat": "{{route}} {{status}}"
+        }
+      ]
+    },
+    {
+      "title": "延迟分位（手写样本：跨实例不可聚合）",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "gw_request_duration_ms{quantile=\"p95\"}",
+          "legendFormat": "{{route}} p95"
+        },
+        {
+          "expr": "gw_request_duration_ms{quantile=\"p99\"}",
+          "legendFormat": "{{route}} p99"
+        }
+      ]
+    },
+    {
+      "title": "在处理中的请求数",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "gw_inflight_requests", "legendFormat": "inflight" }]
+    },
+    {
+      "title": "被限流拒绝（按路由）",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (route) (rate(gw_limit_rejected_total[5m]))", "legendFormat": "{{route}}" }
+      ]
+    },
+    {
+      "title": "熔断器打开次数（按服务）",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (service) (rate(gw_breaker_trips_total[5m]))", "legendFormat": "{{service}}" }
+      ]
+    },
+    {
+      "title": "被摘除的节点数（>0 就该看）",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [{ "expr": "sum(gw_upstream_ejected)", "legendFormat": "ejected" }]
+    },
+    {
+      "title": "兜底捕获的 panic（只要 >0 就要有人看）",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [{ "expr": "gw_panics_total", "legendFormat": "panics" }]
+    },
+    {
+      "title": "节点级在途（least_conn 的调度依据）",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (service, addr) (gw_upstream_inflight)",
+          "legendFormat": "{{service}} {{addr}}"
+        }
+      ]
+    },
+    {
+      "title": "节点级累计失败（按地址）",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (service, addr) (rate(gw_upstream_failures_total[5m]))",
+          "legendFormat": "{{service}} {{addr}}"
+        }
+      ]
+    },
+    {
+      "title": "各节点是否被摘除（1=摘除中）",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "gw_upstream_ejected",
+          "legendFormat": "{{service}} {{addr}}"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["gateway", "gwlab"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30m", "to": "now" },
+  "timezone": "browser",
+  "title": "gateway（gwlab）运行看板",
+  "uid": "gwlab-gateway",
+  "version": 1
+}

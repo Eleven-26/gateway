@@ -1,0 +1,88 @@
+# 演示栈一键起：网关 + 三个演示后端（A 额外开 gRPC）。
+#
+# 用法：
+#   docker compose -f deploy/docker-compose.yml up --build
+#   网关业务端口 http://localhost:18080 ，管理端点 http://localhost:18081
+#
+# ⚠️ 关于网络模式
+#   批次 C1（配置外置）已落地，所以下面用环境变量把监听地址指到 0.0.0.0 即可，**bridge 网络就能直接跑通**：
+#   `ports:` 映射到容器内 0.0.0.0:18080/18081，宿主机用 localhost:18080 / :18081 访问。
+#   如果不想用环境变量，也可以用 host 网络模式（容器与宿主机共用回环，此时内置的 127.0.0.1 直接可用）。
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: gateway:dev
+    command: ["/app/gateway"]
+    environment:
+      # 批次 C1 的注入点：不设则退回内置的 127.0.0.1:18080 / :18081（容器里就访问不到了）
+      GW_LISTEN_ADDR: "0.0.0.0:18080"
+      GW_ADMIN_LISTEN_ADDR: "0.0.0.0:18081"
+      # 可选：挂一份 JSON 配置（覆盖语义）。挂载示例见文件末尾注释。
+      # GW_CONFIG: "/etc/gateway/config.json"
+    ports:
+      - "18080:18080"   # 业务入口
+      - "18081:18081"   # 管理端点（/metrics、/debug/logs、/readyz）—— 生产只应绑内网
+    # network_mode: host   # ← 见文件顶部说明，用环境变量时不需要
+    depends_on:
+      - backend-a
+      - backend-b
+      - backend-c
+    healthcheck:
+      # /healthz 只代表进程活着；就绪看管理端口的 /readyz（它会检查熔断与节点摘除状态）
+      test: ["CMD", "/app/backend", "-h"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  # 演示后端 A：HTTP + gRPC（网关的 order-create 路由走它）
+  backend-a:
+    image: gateway:dev
+    command: ["/app/backend", "-http", "0.0.0.0:19001", "-grpc", "0.0.0.0:19100", "-name", "A"]
+    ports:
+      - "19001:19001"
+      - "19100:19100"
+
+  backend-b:
+    image: gateway:dev
+    command: ["/app/backend", "-http", "0.0.0.0:19002", "-name", "B"]
+    ports:
+      - "19002:19002"
+
+  # 演示后端 C：`/__control?fail=1` 与 `?ms=` 都在它上面演示（熔断、节点摘除、least_conn）
+  backend-c:
+    image: gateway:dev
+    command: ["/app/backend", "-http", "0.0.0.0:19003", "-name", "C"]
+    ports:
+      - "19003:19003"
+
+  # 共享状态服务（审计 C4，只在多副本时才需要）：限流桶 + 熔断打开状态
+  # 把网关配置里的 shared_state.url 指到 http://statestore:18090 即可
+  statestore:
+    image: gateway:dev
+    command: ["/app/statestore", "-listen", "0.0.0.0:18090"]
+    ports:
+      - "18090:18090"   # 生产不要对外暴露：它没有鉴权
+  # 可观测栈（可选）：Prometheus 抓 /metrics，Grafana 用随附看板
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    # network_mode: host   # 与网关一致；host 模式下 prometheus.yml 里的 127.0.0.1:18081 才通
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+    volumes:
+      - ./observability/grafana-dashboard.json:/var/lib/grafana/dashboards/gateway.json:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

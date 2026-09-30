@@ -44,6 +44,9 @@ var failing int32
 var echoHeaders = []string{
 	"X-Forwarded-For", "X-Real-IP", "X-Forwarded-Host", "X-Forwarded-Proto",
 	"X-Forwarded-User", "X-Trace-Id", "X-Client",
+	// W3C 链路头（审计 C5）：网关应当沿用上游 trace-id、为本跳换新 span-id，
+	// 回显这两个头就能直接看出链路传播对不对（tracestate 是别人的私有数据，应原样透传）
+	"traceparent", "tracestate",
 	"X-Company-Id", "X-Tenant-Id", // ⚠️ 这两个应该被网关剥掉，回显里看不到才对
 }
 
