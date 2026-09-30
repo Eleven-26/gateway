@@ -1,0 +1,19 @@
+.idea/
+.workbuddy/
+.qoder/
+.qoder-cn/
+.qoder-cli/
+.verify-tmp/
+
+# 构建产物
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.test
+*.out
+coverage.txt
+
+# 运行期日志
+*.log
