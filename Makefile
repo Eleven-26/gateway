@@ -1,4 +1,4 @@
-# gw-go（module gwlab）构建与检查
+# gateway（module gwlab）构建与检查
 #
 # Windows 下用 Git Bash 或 make（如未安装，可直接用 README 中的 go 命令）。
 

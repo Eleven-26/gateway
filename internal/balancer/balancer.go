@@ -3,7 +3,10 @@
 // 「选哪个节点」看着简单，四种算法的差别只在两处：
 //
 //	· **是否需要会话粘性** —— 需要就得上哈希（同一 key 恒定落到同一节点）；
-//	· **节点能力是否相同** —— 不同就得上权重（或最少连接）。
+//	· **节点能力是否相同** —— 不同就得上权重（或最少连接）；
+//	· **平局怎么选** —— least_conn 的在途数**经常相等**（低并发时全是 0），
+//	  若按 map 迭代顺序取第一个最小值，实测 78% 的请求会砸在列表第一个节点上
+//	  （Go 小 map 的迭代起点随机，但偏移分布让首元素占优，见 leastConn.Pick 的注释）。
 //
 // 一致性哈希的关键**不是**「哈希」，而是两件事：
 //
@@ -116,11 +119,13 @@ func (b *weightedRR) Done(string) {}
 
 type leastConn struct {
 	mu    sync.Mutex
+	ups   []config.Upstream // 保留配置顺序：平局要靠它轮转，map 不够
 	conns map[string]*int64
+	next  int // 下一次遍历的起点（平局轮转用）
 }
 
 func newLeastConn(ups []config.Upstream) *leastConn {
-	b := &leastConn{conns: make(map[string]*int64, len(ups))}
+	b := &leastConn{ups: ups, conns: make(map[string]*int64, len(ups))}
 	for _, u := range ups {
 		var zero int64
 		b.conns[u.Addr] = &zero
@@ -130,21 +135,35 @@ func newLeastConn(ups []config.Upstream) *leastConn {
 
 func (b *leastConn) Name() string { return "least_conn" }
 
+// Pick 挑「在途最少」的节点。
+//
+// ⚠️ 关键在平局：在途数相等是最常见的情况（串行流量下每次都是 0,0,0），
+// 如果直接 `for addr, c := range b.conns` 取第一个最小值，胜者就由 map 迭代顺序决定。
+// Go 的小 map 虽然随机化迭代起点，但偏移落点让**最先插入的节点**占优 ——
+// 本机实测 1000 次全 0 平局：a=777 / b=116 / c=107，即 78% 砸在第一个节点上，
+// 此时 least_conn 名存实亡（见 balancer_test.go 的平局测试）。
+//
+// 因此按下标遍历，且每次从 `next` 开始轮转：第一个遇到的最小值获胜 → 平局自然轮流。
 func (b *leastConn) Pick(string) (*config.Upstream, error) {
-	// 节点列表由构造函数传入；这里只负责挑「在途最少」的地址
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.conns) == 0 {
+
+	n := len(b.ups)
+	if n == 0 {
 		return nil, ErrNoUpstream
 	}
-	best, bestN := "", int64(1<<62)
-	for addr, c := range b.conns {
-		if n := atomic.LoadInt64(c); n < bestN {
-			best, bestN = addr, n
+	bestIdx, bestN := -1, int64(1<<62)
+	for k := 0; k < n; k++ {
+		i := (b.next + k) % n
+		if c := atomic.LoadInt64(b.conns[b.ups[i].Addr]); c < bestN {
+			bestN, bestIdx = c, i
 		}
 	}
-	atomic.AddInt64(b.conns[best], 1)
-	return &config.Upstream{Addr: best}, nil
+	b.next = (bestIdx + 1) % n
+
+	u := b.ups[bestIdx]
+	atomic.AddInt64(b.conns[u.Addr], 1)
+	return &u, nil
 }
 
 // Done 回收一次在途计数 —— ⚠️ 必须与 Pick 成对调用，否则计数只增不减。

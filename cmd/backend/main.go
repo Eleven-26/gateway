@@ -2,7 +2,8 @@
 //
 //   - HTTP：回显收到的路径 / 关键请求头，用来验证网关有没有改对头；
 //   - gRPC：order.OrderService/CreateOrder，用来验证 HTTP→gRPC 协议转换；
-//   - /__control?fail=1|0：运行时切换「返回 500」，用来演示熔断器的三态迁移。
+//   - /__control?fail=1|0：运行时切换「返回 500」，用来演示熔断器的三态迁移；
+//   - 任意路径加 ?ms=800：故意慢响应，用来观察 `least_conn` 的在途计数（见 internal/balancer）。
 //
 // 用法：
 //
@@ -59,6 +60,17 @@ func (b *backend) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 200, map[string]any{"backend": b.name, "failing": atomic.LoadInt32(&failing) == 1})
 		return
+	}
+
+	// ?ms=800：故意放慢响应。网关的 least_conn 只有在请求真的占住连接时才看得出来
+	//（否则在途数永远是 0/1，效果和轮询一样）。上限 5s，仅演示用。
+	if v := r.URL.Query().Get("ms"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			if n > 5000 {
+				n = 5000
+			}
+			time.Sleep(time.Duration(n) * time.Millisecond)
+		}
 	}
 
 	if atomic.LoadInt32(&failing) == 1 {

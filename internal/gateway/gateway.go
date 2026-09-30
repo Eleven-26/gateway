@@ -255,6 +255,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	entry.Upstream = up.Addr
+	// ④ 的收尾：Pick 与 Done 必须成对 —— `least_conn` 完全靠这对调用维护「在途请求数」，
+	// 只 Pick 不 Done 的话计数只增不减，节点会被永久判定为「最忙」（AGENTS.md §5 记录过这个缺口）。
+	// 用 defer 而不是在两条分支里各写一次：下面 ⑤ 协议转换与 ⑥ 反向代理是互斥分支，
+	// 各自都可能在中间提前 return，只有 defer 能保证「有借必有还」。
+	defer lb.Done(up.Addr)
 
 	// ===== ⑤ 协议转换 / ⑥ 反向代理 =====
 	ctx, cancel := context.WithTimeout(r.Context(), svc.Timeout)

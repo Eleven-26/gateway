@@ -14,7 +14,7 @@ type Config struct {
 // Service 按名取上游服务，不存在时返回 nil。
 func (c *Config) Service(name string) *Service { return c.Services[name] }
 
-// Default 返回演示用配置：9 条路由 + 5 个上游服务，覆盖全部七级流水线。
+// Default 返回演示用配置：9 条路由 + 6 个上游服务，覆盖全部七级流水线。
 //
 // 密钥是硬编码的演示值，切勿用于生产。
 func Default() *Config {
@@ -79,10 +79,10 @@ func defaultRoutes() []Route {
 			Transcode: &TranscodePolicy{Service: "order.OrderService", Method: "CreateOrder"},
 		},
 		{
-			// 演示 ① 兜底：任意 Host、任意路径。
-			// ⚠️ 因为它能吃掉一切请求，404 route_not_found 分支在当前配置下不可达。
-			Name: "fallback", Host: "*", Path: "/", PathType: PathPrefix,
-			Upstream: "order-svc",
+			// 演示 ④ 最少连接：配合后端的 `?ms=800` 让请求真的占住连接，
+			// 才看得出「新请求落到在途最少的节点」——计数由主流水线的 Pick/Done 成对维护。
+			Name: "slow", Host: "*", Path: "/slow", PathType: PathExact,
+			Upstream: "slow-svc",
 		},
 	}
 }
@@ -122,6 +122,20 @@ func defaultServices() map[string]*Service {
 			Name: "flaky-svc", Balance: "round_robin",
 			Upstreams: []Upstream{{Addr: "127.0.0.1:19003", Backend: 3}},
 			Timeout:   1 * time.Second,
+			Breaker: BreakerConfig{WindowSize: 10, FailRatio: 0.5, MinRequests: 4,
+				OpenFor: 3 * time.Second, HalfOpenMax: 2},
+		},
+		"slow-svc": {
+			// 演示 ④ least_conn：三个节点权重相同，「谁在途请求最少就发给谁」。
+			// 节点计数由 balancer.New 初始化、由主流水线的 Pick/Done 成对维护
+			//（只 Pick 不 Done 会让计数只增不减 —— 这条链路以前断过，见 AGENTS.md §5）。
+			Name: "slow-svc", Balance: "least_conn",
+			Upstreams: []Upstream{
+				{Addr: "127.0.0.1:19001", Backend: 1},
+				{Addr: "127.0.0.1:19002", Backend: 2},
+				{Addr: "127.0.0.1:19003", Backend: 3},
+			},
+			Timeout: 10 * time.Second, // 要容得下后端的 ?ms= 人为延时
 			Breaker: BreakerConfig{WindowSize: 10, FailRatio: 0.5, MinRequests: 4,
 				OpenFor: 3 * time.Second, HalfOpenMax: 2},
 		},
