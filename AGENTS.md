@@ -210,10 +210,17 @@
   改 `SharedState.URL` / `ListenAddr` 仍需重启。
 - **容器 / k8s 未在真实 daemon / 集群验证**（本机 Docker daemon 未启动）：`Dockerfile`、
   `deploy/docker-compose.yml`、`deploy/k8s/*.yaml` 已就位，但只做过静态核对。
-- **压测报告文档缺**：`scripts/loadtest.py` 与 CI 基准记录已有，但没有成篇的容量 / 拐点报告。
-- **P2-3 / P2-4 / P2-8 仍未修**：API Key 仍支持 `?api_key=` query 传参（会进浏览器历史 / Referer /
-  上游日志）；无 `iss` / `aud` 校验、无 RS256/JWKS、无密钥轮换与吊销；`/metrics` 与 `/debug/logs`
-  自身无鉴权（靠「管理端口只对内网开放」兜住）。
+- **压测报告已补**（D4）：`docs/性能压测报告.md` —— 基线 2077（`/healthz`）/ 1359（`/slow?ms=5`）RPS、
+  并发拐点 c≈20、共享限流判定代价 ≈64%、闸门开销在噪声内；并记录了「压测工具不复用连接 → Windows
+  临时端口耗尽 → 数字自相矛盾」的教训。CI 里的基准记录见 `.github/workflows/ci.yml`。
+- **P2-3 / P2-4 / P2-8 仍未修**（编号见 `docs/网关缺陷审计与优化路线.md` §0 的「仍开放的 3 条 P2」）：
+  P2-3 一致性哈希 key 仍可由客户端头 `X-User-Id` 决定（`config.go` 的 `HashKeyFrom`，客户端可自选落点，
+  应改用**鉴权后的身份**）；P2-4 `Transport` 无 `MaxConnsPerHost`、未设 `DisableCompression`；
+  P2-8 演示配置里 `self` 的零值 `BreakerConfig` 与 `order-svc` 的权重 `3:1:1` 不生效。
+- **鉴权侧未加固（审计未编号，批次 C 期间核对代码新发现）**：API Key 仍支持 `?api_key=` query 传参
+  （`internal/auth/auth.go` 的 `r.URL.Query().Get("api_key")`，密钥会进浏览器历史 / Referer / 上游访问日志）；
+  JWT 无 `iss` / `aud` 校验、无 RS256/JWKS、无密钥轮换与吊销；`/metrics` 与 `/debug/logs` 自身无鉴权
+  （靠「管理端口只对内网开放」兜住）。
 
 > **已修（记录在此以免回退）**：`least_conn` 的平局偏置 —— 原实现按 map 迭代顺序取第一个最小值
 > （`for addr, c := range b.conns`，Go 小 map 迭代起点随机但首元素占优），实测全 0 平局时
