@@ -38,7 +38,7 @@ func serveOnce(t *testing.T, p *Proxy) (int, string) {
 	return rec.Code, rec.Body.String()
 }
 
-// TestUpstreamTLSScheme 覆盖批次 C2 的核心：
+// TestUpstreamTLSScheme 覆盖上游 TLS 的核心：
 //   - scheme=https + 配了上游 CA → 握手成功、能正常转发；
 //   - scheme=https 但没给 CA（用系统根证书）→ 证书校验失败，回 502；
 //   - InsecureSkipVerify 时跳过校验 → 又能通（证明开关真的生效）。

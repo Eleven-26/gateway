@@ -16,14 +16,14 @@ import (
 
 // connBudget 是单次 Conn 的耗时上限。
 //
-// 为什么是 1s：审计 P1-4 里旧实现的建连超时是 3s（WithBlock + context.WithTimeout），
+// 为什么是 1s：旧实现的建连超时是 3s（WithBlock + context.WithTimeout），
 // 所以「1s 内返回」足以区分新旧行为 —— 旧实现撞上黑洞上游必然要等满 3s 才返回。
 const connBudget = time.Second
 
 // blackhole 是一个「只 accept、不说话」的 TCP 上游：TCP 三次握手能完成，
 // 但服务端永远不回 HTTP/2 SETTINGS 帧，客户端也就永远等不到握手完成。
 //
-// 这正是 P1-4 要防的场景：旧实现 grpc.DialContext(..., WithBlock) 会在这里死等 3s，
+// 这正是都要防的场景：旧实现 grpc.DialContext(..., WithBlock) 会在这里死等 3s，
 // 而且因为当时持着 Pool.mu，所有地址的转码请求一起被卡住（头阻塞）。
 type blackhole struct {
 	ln net.Listener
@@ -67,7 +67,7 @@ func (b *blackhole) Close() {
 	b.conns = nil
 }
 
-// TestConnNonBlocking 校验审计 P1-4 的核心修复：建连不再占用请求路径。
+// TestConnNonBlocking 校验核心性质：建连不再占用请求路径。
 //
 //	① Conn(黑洞地址) 必须立刻返回且不报错 —— 连接是后台异步建的；
 //	② 紧接着 Conn(正常地址) 也必须立刻返回，不能被 ① 拖住（per-addr 锁，没有头阻塞）。
@@ -96,7 +96,7 @@ func TestConnNonBlocking(t *testing.T) {
 	}
 	holeCost := time.Since(start)
 	if holeCost > connBudget {
-		t.Fatalf("Conn(黑洞) 耗时 %v，超过 %v —— 建连又跑到请求路径上了（P1-4 回归）", holeCost, connBudget)
+		t.Fatalf("Conn(黑洞) 耗时 %v，超过 %v —— 建连又跑到请求路径上了", holeCost, connBudget)
 	}
 
 	start = time.Now()
@@ -109,7 +109,7 @@ func TestConnNonBlocking(t *testing.T) {
 	}
 	goodCost := time.Since(start)
 	if goodCost > connBudget {
-		t.Fatalf("Conn(正常地址) 耗时 %v，超过 %v —— 被黑洞地址的建连阻塞了（头阻塞，P1-4 回归）",
+		t.Fatalf("Conn(正常地址) 耗时 %v，超过 %v —— 被黑洞地址的建连阻塞了（头阻塞）",
 			goodCost, connBudget)
 	}
 
@@ -142,7 +142,7 @@ func TestBlackholeFixtureActuallyStalls(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	conn, err := grpc.DialContext(ctx, hole.Addr(), //nolint:staticcheck // 故意用旧 API 复现 P1-4 的旧行为
+	conn, err := grpc.DialContext(ctx, hole.Addr(), //nolint:staticcheck // 故意用旧 API 复现 WithBlock 的旧行为
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
 	)
@@ -251,7 +251,7 @@ func echoHandler(_ any, ctx context.Context, dec func(any) error,
 // TestTranscodeEndToEnd 是一条真正的端到端用例：起一个最小 gRPC 服务（注册 json codec 的
 // ServiceDesc，无需 protoc），走完整 Transcode。
 //
-// 为什么必须有它：P1-4 把 DialContext 换成 NewClient，改的不只是「阻不阻塞」——
+// 为什么必须有它：把 DialContext 换成 NewClient，改的不只是「阻不阻塞」——
 // 两者的默认解析器/scheme 与连接策略不同。只测「Conn 秒回」不足以证明转码还能成功，
 // 这里用真实 RPC 把 json codec、metadata 透传、paramN 补参、Invoke 全部串起来验一遍。
 func TestTranscodeEndToEnd(t *testing.T) {

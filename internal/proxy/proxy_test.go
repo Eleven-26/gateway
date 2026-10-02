@@ -45,7 +45,7 @@ func upstreamAddr(srv *httptest.Server) string { return strings.TrimPrefix(srv.U
 
 func echoOf(res *http.Response, h string) string { return res.Header.Get("X-Echo-" + h) }
 
-// TestStripPrefixSegmentBoundary 盯住剥前缀的**路径段边界**（审计 P2-7）：
+// TestStripPrefixSegmentBoundary 盯住剥前缀的**路径段边界**：
 // 原实现是裸 strings.HasPrefix + TrimPrefix，stripPrefix=/api 时 `/apifoo`
 // 会被误剥成 `foo` —— 上游收到一个谁都没定义过的路径。
 func TestStripPrefixSegmentBoundary(t *testing.T) {
@@ -91,7 +91,7 @@ func TestStripPrefixEmpty(t *testing.T) {
 	}
 }
 
-// TestInternalHeadersStripped 盯住「可伪造的内部头必须剥离」（审计 P2-2）：
+// TestInternalHeadersStripped 盯住「可伪造的内部头必须剥离」：
 // 多租户场景下伪造一个 X-Company-Id 就能横向越权；Forwarded / X-Original-URL /
 // X-Rewrite-URL 则是客户端伪造客户端 IP、或诱使后端按伪造路径重写路由的注入面。
 func TestInternalHeadersStripped(t *testing.T) {

@@ -27,7 +27,7 @@ func (s *ReloadSummary) String() string {
 		s.Routes, s.Services, len(s.BreakerKept), s.BalancerRebuilt, s.BalancerKept, s.Removed, s.ProxiesPruned)
 }
 
-// Reload 用新配置原子替换运行时状态（审计 C1：配置外置 + 热重载）。
+// Reload 用新配置原子替换运行时状态。
 //
 // 三个必须遵守的坑（`AGENTS.md` §4 记的就是它们）：
 //  1. **熔断器按服务名复用，绝不重建** —— 重建会把刚打开的熔断器重置回 closed，

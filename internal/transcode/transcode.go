@@ -8,7 +8,7 @@
 //	① **连接必须复用** —— gRPC 连接建立要握手 + HTTP/2 SETTINGS，每请求新建会吃掉全部收益；
 //	② **方法名是 /包.服务/方法** 的字符串（"/order.OrderService/CreateOrder"），
 //	  不需要生成的 stub 也能调用（grpc.ClientConn.Invoke 接任意消息类型）；
-//	③ **建连不能占请求路径，也不能锁全局**（审计 P1-4）—— 见 Pool.Conn：非阻塞建连 + 按地址分锁。
+//	③ **建连不能占请求路径，也不能锁全局**—— 见 Pool.Conn：非阻塞建连 + 按地址分锁。
 //
 // ⚠️ 本机没有 protoc，所以这里注册了一个 JSON codec 代替 protobuf——
 // 传输层仍是真正的 gRPC（HTTP/2 + 帧 + 多路复用 + 超时传播），只是编解码换成 JSON。
@@ -44,7 +44,7 @@ type Pool struct {
 	mu    sync.Mutex
 	conns map[string]*grpc.ClientConn
 
-	// dialing 为每个地址保存一把「拨号锁」（审计 P1-4）。
+	// dialing 为每个地址保存一把「拨号锁」。
 	//
 	// 为什么值得做：Conn 原来在持有 p.mu 的情况下 DialContext(WithBlock, 3s)。
 	// 后果有两个：①一个慢/黑洞上游会把**所有**地址的转码请求一起卡住（头阻塞），
@@ -53,7 +53,7 @@ type Pool struct {
 	//
 	// 容易做错的地方：
 	//   - per-addr 锁必须在 p.mu **之外**获取/释放。如果在持 p.mu 时去抢 per-addr 锁，
-	//     全局串行又回来了，P1-4 等于没修。
+	//     全局串行又回来了，按地址分锁等于没做。
 	//   - 拿到 per-addr 锁后必须**再查一次** p.conns（双重检查），否则同一地址在并发首访时
 	//     会建出多条连接，多余的那些既无人使用也无人关闭（连接泄漏）。
 	//   - dialing 里的锁只增不删：地址集合来自编译期配置，数量有界，留着比为每个地址
@@ -90,7 +90,7 @@ func (p *Pool) dialLock(addr string) *sync.Mutex {
 
 // Conn 取（或建）到该节点的连接。
 //
-// 本函数**立即返回**（审计 P1-4）：grpc.NewClient 只创建 ClientConn（解析 target、
+// 本函数**立即返回**：grpc.NewClient 只创建 ClientConn（解析 target、
 // 拉起后台连接 goroutine），不等 TCP + HTTP/2 SETTINGS 握手完成；真正的建连由后续 RPC
 // 放进该请求自己的 ctx 超时里完成，3s 建连不再占用请求路径，也不再有头阻塞。
 //
@@ -98,7 +98,7 @@ func (p *Pool) dialLock(addr string) *sync.Mutex {
 // conn.Invoke 在该请求的 ctx 上失败 —— 失败边界从「与请求无关的固定 3s」变成「本请求的超时」，
 // 这对网关是对的方向（Transcode 的签名和错误包装都没有改）。
 //
-// scheme=https 的节点走 TLS（审计 C2），TLS 语义与 HTTP 上游**共用** config.Upstream.TLSClientConfig，
+// scheme=https 的节点走 TLS，TLS 语义与 HTTP 上游**共用** config.Upstream.TLSClientConfig，
 // 避免两条链路各写一份而漂移。
 func (p *Pool) Conn(up *config.Upstream) (*grpc.ClientConn, error) {
 	addr := up.Addr
@@ -128,7 +128,7 @@ func (p *Pool) Conn(up *config.Upstream) (*grpc.ClientConn, error) {
 	}
 
 	// 非阻塞建连。⚠️ 千万不要加 grpc.WithBlock()（NewClient 也不支持它）：
-	// 一旦阻塞等待握手，本函数又变成长达数秒的调用，P1-4 直接回归。
+	// 一旦阻塞等待握手，本函数又变成长达数秒的调用，重新把建连放上请求路径。
 	c, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, err
@@ -146,10 +146,9 @@ func (p *Pool) Conn(up *config.Upstream) (*grpc.ClientConn, error) {
 //
 // dialing 有意保留不清空 —— 它只是一张锁表、不持有任何系统资源；清空它反而会在
 // 「Close 与某次 Conn 并发」时制造出两把不同的 per-addr 锁，让同一地址被并发建连。
-// 已知边界（本批次不改）：Close 与并发 Conn 之间没有额外的状态机，正在建连的那次
+// 已知边界：Close 与并发 Conn 之间没有额外的状态机，正在建连的那次
 // 仍可能把新连接写进已清空的 map。Pool 由 Gateway 持有，Close 只在进程退出 /
-// 热重载整体换实例时调用，生产路径上不存在这种并发；真要修需要引入 closed 标志与新错误值，
-// 超出 P1-4 的范围。
+// 热重载整体换实例时调用，生产路径上不存在这种并发；真要修需要引入 closed 标志与新错误值。
 func (p *Pool) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()

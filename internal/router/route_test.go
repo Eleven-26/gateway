@@ -58,7 +58,7 @@ func priorityRoutes() []config.Route {
 
 // TestMatch 表驱动覆盖 Host / Method / Header / 路径优先级。
 //
-// 重点是 Header 与优先级这两块 —— P1-5（头值正则预编译）是纯性能重构，
+// 重点是 Header 与优先级这两块 —— 头值正则预编译是纯性能重构，
 // 这里每一条断言都是「改动前后必须逐字一致」的行为契约。
 func TestMatch(t *testing.T) {
 	cases := []struct {
@@ -297,7 +297,7 @@ func TestMatch(t *testing.T) {
 
 // TestHeaderValuePattern 锁住「通配值 → 锚定正则」的翻译结果。
 //
-// 这就是改动前 headersMatch 里内联拼的那串 "^"+...+ "$"（审计 P1-5 只是把它挪到 New），
+// 这就是改动前 headersMatch 里内联拼的那串 "^"+...+ "$"，
 // 所以逐字比对字符串即可证明语义没变；顺便确认 QuoteMeta 让 . + 等元字符按字面量走。
 func TestHeaderValuePattern(t *testing.T) {
 	cases := []struct{ in, want string }{
@@ -321,7 +321,7 @@ func TestHeaderValuePattern(t *testing.T) {
 	}
 }
 
-// TestNewPrecompilesHeaderWildcards 验证 P1-5 的落点：New 里一次性编译、匹配期零编译。
+// TestNewPrecompilesHeaderWildcards 验证预编译的落点：New 里一次性编译、匹配期零编译。
 func TestNewPrecompilesHeaderWildcards(t *testing.T) {
 	r := mustRouter(t, []config.Route{{
 		Name: "wild", Host: "*", Path: "/h", PathType: config.PathExact,
@@ -374,7 +374,7 @@ func TestNewBadRegexError(t *testing.T) {
 	}
 }
 
-// BenchmarkMatch 度量一次 Match 的耗时与分配（审计 P1-5 前后对比用）。
+// BenchmarkMatch 度量一次 Match 的耗时与分配。
 //
 // 请求刻意打中「带通配头值」的那条路由：改动前 headersMatch 每次请求都对
 // mobile* 现编一次正则（regexp.MatchString → regexp.Compile），

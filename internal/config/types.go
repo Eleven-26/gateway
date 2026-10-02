@@ -23,7 +23,7 @@ const (
 // Route 一条路由规则。
 //
 // 字段带 `json` tag：这份结构同时也是**外部配置文件**（`GW_CONFIG` 指向的 JSON）的 schema，
-// 命名要对外稳定（snake_case）—— 不能拿 Go 字段名当外部接口（审计 C1）。
+// 命名要对外稳定（snake_case）—— 不能拿 Go 字段名当外部接口。
 type Route struct {
 	Name        string            `json:"name"`
 	Host        string            `json:"host"` // 空 = 任意；支持 *.example.com 通配
@@ -33,14 +33,14 @@ type Route struct {
 	Headers     map[string]string `json:"headers,omitempty"` // 必须全部匹配（值支持 * 通配）
 	Upstream    string            `json:"upstream"`
 	StripPrefix string            `json:"strip_prefix,omitempty"`
-	Timeout     Duration          `json:"timeout,omitempty"` // 每路由超时；0 = 用 Service.Timeout（审计 C3）
+	Timeout     Duration          `json:"timeout,omitempty"` // 每路由超时；0 = 用 Service.Timeout
 	Retry       *RetryPolicy      `json:"retry,omitempty"`   // 每路由重试；nil = 不重试
 	Auth        AuthPolicy        `json:"auth,omitempty"`
 	Limit       LimitPolicy       `json:"limit,omitempty"`
 	Transcode   *TranscodePolicy  `json:"transcode,omitempty"` // 非空 = 走「HTTP→gRPC」协议转换
 }
 
-// RetryPolicy 每路由重试策略（审计 C3）。
+// RetryPolicy 每路由重试策略。
 //
 // ⚠️ 重试是**流量放大器**：上游已经过载时，无脑重试会把压力放大 (Attempts+1) 倍。
 // 所以这里刻意只做最安全的那一类重试，并把边界写清楚：
@@ -91,7 +91,7 @@ type Upstream struct {
 	Backend int        `json:"backend,omitempty"` // 仅演示用：后端自报名（用于观测负载均衡分布）
 }
 
-// TLSConfig 上游 TLS 参数（审计 C2）。零值 = 用系统根证书 + 校验主机名，这是最安全的默认。
+// TLSConfig 上游 TLS 参数。零值 = 用系统根证书 + 校验主机名，这是最安全的默认。
 //
 // 为什么值得做：原实现把目标 URL 硬编码成 `http://`，上游只能是明文 HTTP —— 内网服务间 TLS、
 // 以及要求 mTLS 的第三方接口（支付/风控常见）都接不了。
@@ -121,7 +121,7 @@ type Service struct {
 	Ejection    EjectionConfig // 节点级被动摘除；FailThreshold=0 表示不启用
 }
 
-// EjectionConfig 节点级被动摘除（审计 P1-2）。FailThreshold 为 0 表示不启用。
+// EjectionConfig 节点级被动摘除。FailThreshold 为 0 表示不启用。
 //
 // 与 Service.Breaker 的分工：熔断的粒度是**服务**（整个服务快速失败），摘除的粒度是**节点**
 // （只摘掉连续失败的那个地址，其余节点继续服务）。两者互补 —— 节点摘除处理「单点挂了」，

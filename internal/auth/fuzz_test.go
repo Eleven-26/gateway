@@ -31,7 +31,7 @@ func FuzzVerifyJWT(f *testing.F) {
 			t.Fatal("err 为 nil 但 claims 也是 nil")
 		}
 		if claims.Exp == 0 {
-			t.Fatal("无 exp 的令牌不应该通过验签（审计 P0-5）")
+			t.Fatal("无 exp 的令牌不应该通过验签")
 		}
 	})
 }

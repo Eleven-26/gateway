@@ -6,7 +6,7 @@
 //	① 签名覆盖的是「前两段的原始字符串」，不是解析后的 JSON（否则顺序一变签名就失效）；
 //	② 验签必须用 hmac.Equal（恒定时间比较），不能用 ==（会被时序攻击）；
 //	③ exp/nbf 是业务校验，签名过了不代表没过期；且 **exp 必须存在** ——
-//	   「没有 exp 就不过期」等于签一次永久通行（审计 P0-5 修掉了这一点）。
+//	   「没有 exp 就不过期」等于签一次永久通行。
 package auth
 
 import (
@@ -42,7 +42,7 @@ const maxTokenLifetime = 24 * time.Hour
 type Claims struct {
 	Sub  string   `json:"sub"`
 	Role []string `json:"role"`
-	Exp  int64    `json:"exp"` // 必需：无 exp 视为非法（审计 P0-5）
+	Exp  int64    `json:"exp"` // 必需：无 exp 视为非法
 	Iat  int64    `json:"iat"`
 	Nbf  int64    `json:"nbf"`
 }
@@ -78,7 +78,7 @@ func (a *Authenticator) Authenticate(r *http.Request, p config.AuthPolicy) (*Ide
 		}
 		// auth-scheme 大小写不敏感（RFC 7235 §2.1）：原实现 strings.CutPrefix(raw, "Bearer ")
 		// 是逐字节比较，于是 `bearer xxx` / `BEARER xxx` 被判成「凭证格式错误」而 401
-		//（实测踩过，审计 P2-1）。这里只对 scheme 做 EqualFold，分隔符仍严格要求空格，
+		//（实测踩过）。这里只对 scheme 做 EqualFold，分隔符仍严格要求空格，
 		// 所以 `Token xxx` 这类别的 scheme 依旧被拒。
 		scheme, token, ok := strings.Cut(raw, " ")
 		if !ok || !strings.EqualFold(scheme, "Bearer") {
@@ -143,7 +143,7 @@ func (a *Authenticator) VerifyJWT(token string) (*Claims, error) {
 	}
 	now := time.Now().Unix()
 	// ⚠️ exp 必须存在：原实现是 `if c.Exp > 0 && now > c.Exp`，于是 exp 缺失的令牌
-	// 被当成「永不过期」接受（实测 200）—— 等于给了一把不能吊销的永久钥匙（审计 P0-5）。
+	// 被当成「永不过期」接受（实测 200）—— 等于给了一把不能吊销的永久钥匙。
 	if c.Exp == 0 {
 		return nil, ErrNoExpiry
 	}

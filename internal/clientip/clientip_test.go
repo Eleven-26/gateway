@@ -34,7 +34,7 @@ func TestResolve(t *testing.T) {
 			headers:    map[string]string{"X-Forwarded-For": "1.2.3.4", "X-Real-IP": "5.6.7.8"},
 			trusted:    []string{"10.0.0.0/8"},
 			want:       "203.0.113.9",
-			why:        "不看对端就采信 XFF = 匿名客户端可伪造 IP 绕过限流（审计 P1-3 错误修法的典型形态）",
+			why:        "不看对端就采信 XFF = 匿名客户端可伪造 IP 绕过限流",
 		},
 		{
 			// 同上，但 trusted 为空切片：等价于「没有任何可信代理」。

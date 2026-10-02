@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// TestOverlayJSON 覆盖语义（审计 C1）：
+// TestOverlayJSON 覆盖语义：
 //   - 只改"写了"的字段，其余保持默认；
 //   - routes / services 是**整体替换**（避免"删不掉的旧服务"）；
 //   - 时长写成 "1500ms" 这种人类可读形式；

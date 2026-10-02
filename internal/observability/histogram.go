@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-// 手写 Prometheus 直方图（审计 C5）。
+// 手写 Prometheus 直方图。
 //
 // 为什么需要：原来的分位是"当场算出来的近似值"（`gw_request_duration_ms{quantile="p95"}`），
 // 它**不能跨实例聚合** —— 多副本时没法把两个副本的 p95 合起来得到全局 p95，
@@ -104,7 +104,7 @@ func (m *Metrics) renderDurations() string {
 	return b.String()
 }
 
-// renderRuntime 输出最小的运行时指标（审计 C5：原来一个 go_*/process_* 都没有）。
+// renderRuntime 输出最小的运行时指标。
 //
 // 只挑排障最常用的四个：goroutine 数（泄漏第一眼）、堆内存、向 OS 申请的内存、GC 次数。
 // 不引 client_golang 就无法复用官方的采集器，所以这里显式用 runtime 包自己取。
@@ -136,7 +136,7 @@ func (m *Metrics) renderRuntime() string {
 // sortedKeys 返回 map 的键（已排序）。
 //
 // /metrics 的输出必须**稳定**：map 迭代顺序随机会让每次抓取的行序都不同，
-// 看板与 diff 都会抖（审计 P2-5 记录的就是这个问题）。
+// 看板与 diff 都会抖。
 func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {

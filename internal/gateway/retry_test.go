@@ -160,7 +160,7 @@ func TestPerRouteTimeout(t *testing.T) {
 	}
 }
 
-// TestProxyErrorLandsInAccessLog：批次 C3 顺带修掉的老缺口 ——
+// TestProxyErrorLandsInAccessLog：盯住一个老缺口 ——
 // 代理链路的上游错误以前进不了访问日志（ErrorHandler 改的是 Clone 出去的 Header）。
 // 现在用 context 传递，日志里必须能看到 err=。
 func TestProxyErrorLandsInAccessLog(t *testing.T) {

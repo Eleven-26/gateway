@@ -32,25 +32,28 @@ func main() {
 }
 
 func run() error {
-	// 配置来源：内置默认 → GW_CONFIG 指向的 JSON → 环境变量覆盖 → 启动期校验（审计 C1）。
+	// 1、加载配置
+	// 配置来源：内置默认 → GW_CONFIG 指向的 JSON → 环境变量覆盖 → 启动期校验。
 	// 校验不过就直接退出：错误配置必须在启动期暴露，而不是等某个请求变成 500。
 	cfg, source, err := config.Load()
 	if err != nil {
 		return err
 	}
 
+	// 2、装配网关
 	gw, err := gateway.New(cfg)
 	if err != nil {
 		return err
 	}
 	defer gw.Close()
 
+	// 3、创建业务 HTTP Server。net/http 每收到一个请求，就在连接的 goroutine 里调用 gw.ServeHTTP(w, r)。
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           gw,
+		Handler:           gw, // ← Gateway 实现了 http.Handler，把网关注册为 HTTP 处理器。
 		ReadHeaderTimeout: 3 * time.Second,
 		// ReadTimeout 覆盖「请求体读取」：只设 ReadHeaderTimeout 时，慢速滴流的 body
-		// 能长期占住连接与 goroutine（审计 P0-4）。
+		// 能长期占住连接与 goroutine。
 		ReadTimeout: 30 * time.Second,
 		// WriteTimeout 由配置里最大的 Service.Timeout 推导 + 余量，必须容得下最慢的上游往返。
 		// ⚠️ 它会掐断超过该时长的「长连接流式响应」（SSE）；要支持长流需按路由放宽，
@@ -59,7 +62,8 @@ func run() error {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// 管理端点单独监听（审计 P1-6）：业务端口不再暴露 /metrics、/debug/logs、/readyz。
+	// 4、创建管理端 HTTP Server（可选）
+	// 管理端点单独监听：业务端口不再暴露 /metrics、/debug/logs、/readyz。
 	// 生产可以只让管理端口绑定回环或内网；AdminListenAddr 为空则退回「与业务同端口」。
 	var adminSrv *http.Server
 	if cfg.AdminListenAddr != "" {
@@ -78,16 +82,18 @@ func run() error {
 		}()
 	}
 
+	// 5、打印启动横幅，输出监听地址、配置来源、负载保护状态、共享状态、管理端点、所有路由。
 	printBanner(cfg, source)
 
-	// 配置热重载（审计 C1）：轮询 GW_CONFIG 指向文件的 mtime，变了就重新加载并原地替换。
+	// 6、启动配置热重载
+	// 配置热重载：轮询 GW_CONFIG 指向文件的 mtime，变了就重新加载并原地替换。
 	// 为什么轮询：标准库没有跨平台的 inotify，而 Windows 没有 SIGHUP —— 轮询在两个平台上行为一致。
 	// 失败时**保留旧配置**并打日志：把配置写坏不应该让在跑的网关挂掉。
 	if path := strings.TrimSpace(os.Getenv("GW_CONFIG")); path != "" {
 		go watchConfig(path, gw)
 	}
 
-	// 优雅退出：收到中断后停止接收新连接，给在途请求 10 秒收尾时间。
+	// 7、优雅退出：收到中断后停止接收新连接，给在途请求 10 秒收尾时间。
 	idle := make(chan struct{})
 	go func() {
 		sig := make(chan os.Signal, 1)
@@ -103,6 +109,8 @@ func run() error {
 		close(idle)
 	}()
 
+	// 8、启动监听（阻塞）。ListenAndServe 阻塞，直到收到退出信号、Shutdown 完成、idle 关闭。
+	// 监听之后，net/http 每收到一个请求，就在连接的 goroutine 里调用 gw.ServeHTTP(w, r)。
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

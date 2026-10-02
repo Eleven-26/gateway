@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-// TLSClientConfig 把声明式的 TLS 参数翻成 crypto/tls 的配置（审计 C2）。
+// TLSClientConfig 把声明式的 TLS 参数翻成 crypto/tls 的配置。
 //
 // 放在 config 包里而不是各调用方各写一份：proxy（HTTP 上游）与 transcode（gRPC 上游）
 // 需要**完全一致**的 TLS 语义，各写一份迟早会漂移（比如一边记得加 SNI、另一边忘了）。

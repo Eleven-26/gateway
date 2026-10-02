@@ -8,7 +8,7 @@
 // 这样从 Nginx 迁过来时行为不会突变 —— ⚠️ 注意「正则优先于普通前缀」这一条，
 // 顺序写反会导致兜底的 location / 抢走本该由正则处理的请求（本机实测踩过）。
 //
-// 路径正则和头值正则都在 New 里预编译（头值部分对应审计 P1-5）：原先
+// 路径正则和头值正则都在 New 里预编译：原先
 // headersMatch 每收到一个含 * 的头值就调用一次
 // regexp.MatchString("^" + strings.ReplaceAll(regexp.QuoteMeta(v), `\*`, ".*") + "$", got)，
 // 等于每个请求编译一次正则并分配内存；现在编译结果挂在 compiledRoute.headerRes 上，
@@ -18,11 +18,11 @@
 //   - 「正则优先于普通前缀」写反了，兜底的前缀 location 会抢走本该走正则的请求；
 //   - 头值通配是大小写敏感的（QuoteMeta 之后只把 \* 换成 .*，再首尾加锚点），
 //     而不含 * 的头值走 strings.EqualFold（大小写不敏感）—— 顺手给通配正则加 (?i)
-//     就把语义改掉了，P1-5 是纯性能重构，行为必须与改动前逐字一致；
+//     就把语义改掉了，头值预编译是纯性能重构，行为必须与改动前逐字一致；
 //   - 规则里的每个头都必须存在，req.Header.Get(k) == "" 一律视为不匹配
 //     （所以头值不能配成空串）；
 //   - 预编译只做一次，别在 headersMatch 里回退成「没查到就现编」——
-//     那等于把审计要修的问题又搬了回来。
+//     那等于把每请求现编正则的老问题又搬了回来。
 package router
 
 import (
@@ -45,7 +45,7 @@ type compiledRoute struct {
 	config.Route
 	re *regexp.Regexp
 
-	// headerRes 是「带通配符的头值」预编译好的正则，key 为头名（审计 P1-5）。
+	// headerRes 是「带通配符的头值」预编译好的正则，key 为头名。
 	// 只有值里含 * 且不等于 "*" 的头才会出现在这里；nil 表示该路由没有这类头。
 	headerRes map[string]*regexp.Regexp
 }
@@ -57,7 +57,7 @@ type Router struct {
 
 // New 编译路由表 —— 正则在这里一次性编译，匹配阶段不再解析。
 //
-// 两条都要编译：PathType == regex 的路径正则，以及含通配符的头值正则（审计 P1-5）。
+// 两条都要编译：PathType == regex 的路径正则，以及含通配符的头值正则。
 // 任何一条编译失败都让 New 返回错误 —— 路由表是启动期加载的，编译不过属于配置错误，
 // 不该等到第一个请求打进来才暴露（也是原来每请求 regexp.MatchString 静默吞错的地方）。
 func New(rs []config.Route) (*Router, error) {
@@ -90,7 +90,7 @@ func New(rs []config.Route) (*Router, error) {
 	return r, nil
 }
 
-// headerValuePattern 把一个含 * 的头值翻译成锚定正则 —— 语义与 P1-5 之前逐字一致：
+// headerValuePattern 把一个含 * 的头值翻译成锚定正则 —— 语义与原「每请求现编」实现逐字一致：
 // QuoteMeta 之后只把 `\*` 换回 `.*`，再首尾加 ^ / $。大小写敏感，不要加 (?i)。
 //
 // 只在这里出现一次，编译由 New 调用；headerRes 存的正是它的结果。
@@ -173,7 +173,7 @@ func hostMatch(rule, host string) bool {
 // 三种取值，语义与改动前完全一致：
 //   - "*"：只要头存在（非空）就算过；
 //   - 含 *（不是单个 "*"）：走 c.headerRes[k] 里预编译好的锚定正则，大小写敏感 ——
-//     审计 P1-5 只把「每请求现编」换成「New 里预编」，语义不动；
+//     这里只把「每请求现编」换成「New 里预编」，语义不动；
 //   - 其它：strings.EqualFold，大小写不敏感。
 func headersMatch(c *compiledRoute, req *http.Request) bool {
 	for k, v := range c.Headers {

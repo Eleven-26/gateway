@@ -47,7 +47,7 @@ func newTestGateway(t *testing.T, h http.HandlerFunc) *Gateway {
 
 // TestWebSocketUpgrade 协议升级必须成功 —— statusWriter 靠 Unwrap 把底层连接让给 ReverseProxy。
 //
-// 修复前实测：客户端拿到 "HTTP/1.1 502 Bad Gateway"（审计 P0-1）。
+// 修复前实测：客户端拿到 "HTTP/1.1 502 Bad Gateway"。
 // 根因是 ReverseProxy 用 http.NewResponseController(rw).Hijack() 拿连接，而 Controller 只认
 // Hijacker 或 Unwrap()；包装类两个都没有时就 ErrNotSupported。
 func TestWebSocketUpgrade(t *testing.T) {
@@ -124,7 +124,7 @@ type panicWriter struct{ http.ResponseWriter }
 func (p panicWriter) Write([]byte) (int, error) { panic("boom: 模拟 handler 内部 panic") }
 
 // TestPanicIsRecoveredAndCounted：panic 不能逃出 ServeHTTP，且必须能在指标里看到。
-// 修复前：net/http 会替我们 recover，但客户端只看到连接重置，/metrics 与 /debug/logs 里什么都没有（审计 P0-2）。
+// 修复前：net/http 会替我们 recover，但客户端只看到连接重置，/metrics 与 /debug/logs 里什么都没有。
 func TestPanicIsRecoveredAndCounted(t *testing.T) {
 	gw := newTestGateway(t, func(w http.ResponseWriter, r *http.Request) {})
 
@@ -137,7 +137,7 @@ func TestPanicIsRecoveredAndCounted(t *testing.T) {
 	}
 }
 
-// TestBodyLimitRejectsOversizedBody：Content-Length 超过上限时，在鉴权之前就以 413 拒绝（审计 P0-3）。
+// TestBodyLimitRejectsOversizedBody：Content-Length 超过上限时，在鉴权之前就以 413 拒绝。
 func TestBodyLimitRejectsOversizedBody(t *testing.T) {
 	gw := newTestGateway(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("超限请求不应到达上游")

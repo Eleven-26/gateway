@@ -19,7 +19,7 @@ const selfService = "self"
 // 为什么值得做：以前 `Route.Upstream` 写错服务名，要等真有请求打进来才返回 500 `bad_config`
 // （`internal/gateway/gateway.go`）；`BreakerConfig.MinRequests > WindowSize` 会让熔断器永不打开
 // 且毫无提示；缺少 `GRPC: true` 节点却在路由上声明了 `Transcode`，会一直连到 HTTP 端口上去。
-// 这类错误的代价是「上线才发现」，而检查成本只有一次遍历（审计 P1-1）。
+// 这类错误的代价是「上线才发现」，而检查成本只有一次遍历。
 //
 // 容易做错的地方：
 //   - `self` 是伪服务（网关自答），允许没有上游节点；
@@ -43,7 +43,7 @@ func (c *Config) Validate() error {
 	if _, err := parseTrusted(c.TrustedProxies); err != nil {
 		return fmt.Errorf("TrustedProxies 配置有误: %w", err)
 	}
-	// 限流后端（审计 C4）：URL 写错就启动失败，别等第一个被限流的请求才暴露
+	// 限流后端：URL 写错就启动失败，别等第一个被限流的请求才暴露
 	if u := strings.TrimSpace(c.SharedState.URL); u != "" {
 		parsed, err := url.Parse(u)
 		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
@@ -56,7 +56,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("SharedState.SyncInterval 不能为负")
 		}
 	}
-	// 负载保护（审计 C6）
+	// 负载保护
 	if c.Overload.MaxInflight < 0 || c.Overload.MaxQueue < 0 {
 		return fmt.Errorf("Overload 的 MaxInflight/MaxQueue 不能为负")
 	}
@@ -101,7 +101,7 @@ func (c *Config) validateServices() error {
 			if u.Weight < 0 {
 				return fmt.Errorf("服务 %q 的节点 %s 权重为负", name, u.Addr)
 			}
-			// scheme / TLS（审计 C2）：https 时在**启动期**就把证书文件读出来解析 ——
+			// scheme / TLS：https 时在**启动期**就把证书文件读出来解析 ——
 			// 路径写错、证书与私钥不匹配都让进程起不来，而不是等第一个请求报握手错。
 			switch u.SchemeOrDefault() {
 			case "http":
@@ -184,7 +184,7 @@ func (c *Config) validateRoutes() error {
 		if r.Limit.RatePerSec > 0 && r.Limit.Burst == 0 {
 			return fmt.Errorf("%s 配了 RatePerSec 但 Burst=0：桶容量为 0 会拒绝所有请求", where)
 		}
-		// 每路由超时与重试（审计 C3）
+		// 每路由超时与重试
 		if r.Timeout < 0 {
 			return fmt.Errorf("%s 的 Timeout 不能为负（0 = 用 Service.Timeout）", where)
 		}

@@ -12,13 +12,13 @@ type Config struct {
 	JWTSecret       string              // HS256 签名密钥
 	APIKey          string              // 静态 API Key
 	TrustedProxies  []string            // 可信代理的 CIDR（如 "10.0.0.0/8"）；只有来自这些地址的请求才采信 XFF/X-Real-IP
-	SharedState     SharedStateConfig   // 限流与熔断的共享状态服务（审计 C4）；URL 为空 = 都在进程内
-	Overload        OverloadConfig      // 负载保护（审计 C6）；MaxInflight=0 = 不启用
+	SharedState     SharedStateConfig   // 限流与熔断的共享状态服务；URL 为空 = 都在进程内
+	Overload        OverloadConfig      // 负载保护；MaxInflight=0 = 不启用
 	Routes          []Route             // 路由表（顺序无关，按匹配优先级打分）
 	Services        map[string]*Service // 上游服务表，key 为服务名
 }
 
-// SharedStateConfig 共享状态服务（限流 + 熔断共用一个服务，审计 C4）。
+// SharedStateConfig 共享状态服务（限流 + 熔断共用一个服务）。
 //
 // 为什么值得做：网关的限流桶、熔断器都是**进程内**状态 —— 多副本时每个副本各一份，
 // 后果是①限流实际放行量 = 副本数 × 阈值；②A 副本已熔断的服务，B 副本还在打流量。
@@ -43,7 +43,7 @@ type SharedStateConfig struct {
 	SyncInterval Duration `json:"sync_interval,omitempty"` // 熔断状态拉取间隔；默认 1s
 }
 
-// OverloadConfig 负载保护（审计 C6）。
+// OverloadConfig 负载保护。
 //
 // 与限流的区别（最容易混的一对概念）：
 //
@@ -77,7 +77,7 @@ func (c *Config) Service(name string) *Service { return c.Services[name] }
 // MaxServiceTimeout 返回**单次请求可能花掉的最长时间上界** —— cmd/gateway 用它推导
 // http.Server 的 WriteTimeout（必须容得下最慢的一次上游往返）。没有服务时返回 0。
 //
-// 从批次 C3（每路由超时 + 重试）起，它同时考虑三件事，否则 WriteTimeout 会把还在重试的
+// 它同时考虑三件事，否则 WriteTimeout 会把还在重试的
 // 请求拦腰掐断（客户端看到连接被重置，而不是网关的错误响应）：
 //   - 每路由超时 Route.Timeout（覆盖 Service.Timeout）；
 //   - 重试：最坏耗时 ≈ 单次尝试超时 × (Attempts+1)；
@@ -118,7 +118,7 @@ func (c *Config) MaxServiceTimeout() time.Duration {
 func Default() *Config {
 	return &Config{
 		ListenAddr: "127.0.0.1:18080",
-		// 管理端点单独监听（审计 P1-6）：业务端口不再暴露 /metrics 与 /debug/logs，
+		// 管理端点单独监听：业务端口不再暴露 /metrics 与 /debug/logs，
 		// 生产可以只让管理端口绑定 127.0.0.1 或内网。留空则退回「与业务同端口」的老行为。
 		AdminListenAddr: "127.0.0.1:18081",
 		JWTSecret:       "demo-secret-do-not-use-in-prod",
@@ -207,7 +207,7 @@ func defaultServices() map[string]*Service {
 				{Addr: "127.0.0.1:19003", Weight: 1, Backend: 3},
 			},
 			Timeout: 2 * time.Second,
-			// 节点级被动摘除（审计 P1-2）：连续 3 次 5xx 就摘掉那个节点 5 秒，到期放一个探测
+			// 节点级被动摘除：连续 3 次 5xx 就摘掉那个节点 5 秒，到期放一个探测
 			Ejection: EjectionConfig{FailThreshold: 3, Cooldown: 5 * time.Second},
 			Breaker: BreakerConfig{WindowSize: 10, FailRatio: 0.5, MinRequests: 4,
 				OpenFor: 3 * time.Second, HalfOpenMax: 2},

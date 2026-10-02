@@ -42,9 +42,9 @@ import (
 //	· X-Forwarded-User：网关鉴权后写入的可信用户，入站同名头必须先剥（见 Director ②）；
 //	· Forwarded（RFC 7239）：XFF 的标准化写法，等价于可伪造的客户端 IP / 协议信息，
 //	  只在剥离列表里处理——网关自己重写的是 X-Real-IP / X-Forwarded-Host / X-Forwarded-Proto，
-//	  它们语义上属于「网关重写」而不是「入站剥离」（审计 P2-2）；
+//	  它们语义上属于「网关重写」而不是「入站剥离」；
 //	· X-Original-URL / X-Rewrite-URL：nginx / IIS 系常用注入面，部分后端框架（或前端
-//	  反向代理串联时）会按它重写实际处理的路径，从而绕过网关的路由与鉴权规则（审计 P2-2）。
+//	  反向代理串联时）会按它重写实际处理的路径，从而绕过网关的路由与鉴权规则。
 var InternalHeaders = []string{
 	"X-Company-Id", "X-Tenant-Id", "X-User-Id", "X-Internal-Call", "X-Forwarded-User",
 	"Forwarded", "X-Original-URL", "X-Rewrite-URL",
@@ -57,7 +57,7 @@ type Proxy struct {
 	inner *httputil.ReverseProxy
 }
 
-// New 构造代理。scheme / TLS 决定怎么连上游（审计 C2）：
+// New 构造代理。scheme / TLS 决定怎么连上游：
 //   - scheme 空或 http → 明文；
 //   - https → 用 upstream.TLSClientConfig()（自定义 CA / SNI / mTLS / 跳过校验）。
 //
@@ -97,7 +97,7 @@ func New(upstream *config.Upstream, stripPrefix string) *Proxy {
 
 			// 剥前缀只在**路径段边界**上做：path == prefix 或 path 以 prefix+"/" 开头。
 			// ⚠️ 原实现是裸 strings.HasPrefix + TrimPrefix，于是 stripPrefix=/api 时
-			// `/apifoo` 会被误剥成 `foo`（前缀撞车，审计 P2-7）——上游收到一个谁都没定义过的路径。
+			// `/apifoo` 会被误剥成 `foo`（前缀撞车）——上游收到一个谁都没定义过的路径。
 			// 剥完为空则置 "/"（保留原有行为：/api → /）；剥不掉时路径原样透传。
 			if stripPrefix != "" && (req.URL.Path == stripPrefix || strings.HasPrefix(req.URL.Path, stripPrefix+"/")) {
 				req.URL.Path = strings.TrimPrefix(req.URL.Path, stripPrefix)
@@ -117,7 +117,7 @@ func New(upstream *config.Upstream, stripPrefix string) *Proxy {
 			req.Header.Set("X-Forwarded-Host", req.Host)
 			req.Header.Set("X-Forwarded-Proto", scheme(req))
 
-			// ③ 链路追踪（审计 C5）：把**本跳**的 traceparent 写给下游（W3C 标准格式），
+			// ③ 链路追踪：把**本跳**的 traceparent 写给下游（W3C 标准格式），
 			// 同时保留 X-Trace-Id 兼容老后端。注意这是"覆盖"而不是"透传"：
 			// 我们为本跳生成了新的 span-id，客户端的 span-id 不该出现在这一段链路里。
 			if tr, ok := observability.TraceFrom(req.Context()); ok {
@@ -149,18 +149,18 @@ func New(upstream *config.Upstream, stripPrefix string) *Proxy {
 				status, msg = http.StatusBadGateway, "upstream refused"
 			default:
 				// 请求体超限：gateway 用 http.MaxBytesReader 兜住 chunked / 谎报 Content-Length
-				// 的情况，错误只在真正读取时才暴露，这里把它映射成 413 而不是 502（审计 P0-3）。
+				// 的情况，错误只在真正读取时才暴露，这里把它映射成 413 而不是 502。
 				var mbe *http.MaxBytesError
 				if errors.As(err, &mbe) {
 					status, msg = http.StatusRequestEntityTooLarge, "request body too large"
 				}
 			}
-			// 批次 C3：把错误记进 context（Header 传不回来，见 ErrFrom 的说明）——
+			// 把错误记进 context（Header 传不回来，见 ErrFrom 的说明）——
 			// 这样访问日志的 err= 终于能拿到代理链路的错误，重试循环也要靠它。
 			markErr(r, msg)
 
 			// 带重试的路由：只要**还没写出任何字节**，就把错误响应的写法交给上层，
-			// 由重试循环决定"换个节点再试"还是"最终报错"（审计 C3）。
+			// 由重试循环决定"换个节点再试"还是"最终报错"。
 			// 已经写出去（响应中途失败）就没法重试，只能就地结束。
 			if deferred(r) && !wroteAlready(w) {
 				return
@@ -193,7 +193,7 @@ func isConnRefused(err error) bool {
 //
 // ⚠️ 它其实**传不回来**：ReverseProxy 把出站请求 Clone 了一份，Header 是深拷贝，
 // 在 ErrorHandler 里改它对主流程不可见（这就是"proxy 的上游错误不落访问日志"那个老缺口的成因）。
-// 批次 C3 起改用 context 传递（`ErrHolder`），ErrFrom 优先读 context，Header 只作兼容兜底。
+// 错误经 context 传递（`ErrHolder`），ErrFrom 优先读 context，Header 只作兼容兜底。
 const ErrHeader = "X-GW-Upstream-Error"
 
 // ErrHolder 承载「本次转发的错误」。用 context 而不是 Header 的原因见 ErrHeader。
@@ -209,7 +209,7 @@ func WithErrHolder(r *http.Request) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), errHolderKey{}, &ErrHolder{}))
 }
 
-// WithDeferredError 标记「上游错误先别写响应，交给调用方决定」（重试用，审计 C3）。
+// WithDeferredError 标记「上游错误先别写响应，交给调用方决定」（重试用）。
 func WithDeferredError(r *http.Request) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), deferredKey{}, true))
 }
@@ -241,7 +241,7 @@ func ErrFrom(r *http.Request) string {
 }
 
 // wroteReporter 由 gateway 的 statusWriter 实现，用于判断「响应是否已经开始写出」——
-// 已经写出去的响应没法重试（审计 C3）。
+// 已经写出去的响应没法重试。
 type wroteReporter interface{ Wrote() bool }
 
 func wroteAlready(w http.ResponseWriter) bool {

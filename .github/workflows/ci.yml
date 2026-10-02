@@ -3,8 +3,11 @@
 name: ci
 
 on:
+  # 分支 push 时触发，没有 branches 则是任何分支
   push:
+    branches: [master]
   pull_request:
+    branches: [master]
 
 jobs:
   check:

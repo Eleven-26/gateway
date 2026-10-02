@@ -196,7 +196,7 @@ func TestNewDispatchesByBalance(t *testing.T) {
 	}
 }
 
-// ---- 以下为审计 P1-2（节点级被动摘除）+ B3（节点级指标）追加的用例 ----
+// ---- 以下为节点级被动摘除 + 节点级指标的用例 ----
 
 // TestStatsFollowUpstreamOrder Stats 必须按 Service.Upstreams 的顺序返回（/metrics 的行序
 // 因此稳定），且初始状态下没人被摘、计数为 0。
@@ -463,7 +463,7 @@ func TestFailThresholdZeroNeverEjects(t *testing.T) {
 	}
 }
 
-// TestInflightStatsCounting B3：四种算法都要有节点级在途计数（含 round_robin），
+// TestInflightStatsCounting：四种算法都要有节点级在途计数（含 round_robin），
 // Pick 与 Done 成对后回到 0。单节点服务让断言与算法无关。
 func TestInflightStatsCounting(t *testing.T) {
 	for _, balance := range []string{"round_robin", "weighted", "least_conn", "consistent_hash"} {

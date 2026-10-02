@@ -11,7 +11,7 @@ import (
 	"gwlab/internal/config"
 )
 
-// TestVerifyJWTExpiryPolicy 盯住 exp 策略（审计 P0-5）：
+// TestVerifyJWTExpiryPolicy 盯住 exp 策略：
 // 修之前 `if c.Exp > 0 && now > c.Exp` 会把「没有 exp」当成永不过期（实测返回 200）。
 func TestVerifyJWTExpiryPolicy(t *testing.T) {
 	a := New("test-secret", "test-key")
@@ -74,7 +74,7 @@ func TestAuthenticateAPIKey(t *testing.T) {
 	}
 }
 
-// TestAuthenticateBearerSchemeCaseInsensitive 盯住 auth-scheme 大小写不敏感（审计 P2-1）：
+// TestAuthenticateBearerSchemeCaseInsensitive 盯住 auth-scheme 大小写不敏感：
 // RFC 7235 §2.1 规定 scheme 大小写不敏感，但原实现是 strings.CutPrefix(raw, "Bearer ")，
 // 逐字节比较，于是实测 `bearer <合法token>` 被答成 401「凭证格式错误」。
 func TestAuthenticateBearerSchemeCaseInsensitive(t *testing.T) {

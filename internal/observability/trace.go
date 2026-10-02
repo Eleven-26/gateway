@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// W3C Trace Context（审计 C5）。
+// W3C Trace Context。
 //
 // 为什么值得做：原来只有一个自定义的 `X-Trace-Id` —— 它能在自己的系统里串起来，
 // 但**接不进任何标准链路追踪**（Jaeger/Tempo/各云厂商 APM 都认 W3C `traceparent`）。

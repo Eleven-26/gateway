@@ -6,7 +6,7 @@ import (
 	"gwlab/internal/config"
 )
 
-// retryPlan 一次请求的重试计划（审计 C3）。
+// retryPlan 一次请求的重试计划。
 //
 // `deferErr` 决定是否请 proxy「先把上游错误记下来、别写响应」：
 // 只有真的可能重试时才推迟错误响应，否则保持原行为（ErrorHandler 立刻写 502）——

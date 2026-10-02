@@ -37,7 +37,7 @@ func TestHistogramCumulativeBuckets(t *testing.T) {
 }
 
 // TestRenderIsStable：同一份指标连渲染两次必须**逐字节相同**。
-// 这是 P2-5（Render 里三处 map 未排序）的回归用例：map 迭代顺序随机会让看板与 diff 抖动。
+// 这是 Render 输出稳定性的回归用例：map 迭代顺序随机会让看板与 diff 抖动。
 // 运行时指标（goroutine 数等）会自己变，所以比对前先剔掉。
 func TestRenderIsStable(t *testing.T) {
 	m := NewMetrics()
@@ -59,7 +59,7 @@ func TestRenderIsStable(t *testing.T) {
 }
 
 // TestRenderIncludesHistogramAndRuntime：直方图与运行时指标都得在 /metrics 里出现
-// （审计 C5 的两项：可聚合的分位 + 最小的 go_* 替代品）。
+// 。
 func TestRenderIncludesHistogramAndRuntime(t *testing.T) {
 	m := NewMetrics()
 	m.Observe("order-list", 200, 12*time.Millisecond)

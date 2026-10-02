@@ -25,7 +25,7 @@ const TraceHeader = "X-Trace-Id"
 
 // EnsureTraceID 复用上游传进来的（网关可能是链路中间一环），没有才生成。
 //
-// 从批次 C5 起它只是 StartTrace 的薄封装（保留旧调用点与测试）：真正干活的是
+// 它现在只是 StartTrace 的薄封装（保留旧调用点与测试）：真正干活的是
 // StartTrace —— 它会先看 W3C traceparent，再退回 X-Trace-Id，并为本跳生成 span-id。
 func EnsureTraceID(h http.Header) string { return StartTrace(h).TraceID }
 
@@ -37,15 +37,15 @@ type Entry struct {
 	Method     string
 	Path       string
 	Host       string
-	ClientIP   string // 真实客户端 IP（走可信代理链解析，审计 P1-3）
-	SpanID     string // 本跳 span-id（W3C traceparent 的 16 位，审计 C5）
+	ClientIP   string // 真实客户端 IP（走可信代理链解析）
+	SpanID     string // 本跳 span-id（W3C traceparent 的 16 位）
 	Route      string // 命中的路由名，空 = 未匹配
 	MatchWhy   string // 为什么命中（exact/prefix/regex）
 	Identity   string
 	Upstream   string // 实际转发的节点
 	Status     int
 	Latency    time.Duration // 网关侧总耗时
-	UpstreamMs int64         // 上游往返耗时（毫秒）；与 Latency 的差就是网关自身开销（审计 B8）
+	UpstreamMs int64         // 上游往返耗时（毫秒）；与 Latency 的差就是网关自身开销
 	Bytes      int64
 	LimitHit   bool
 	BreakerSt  string
@@ -67,7 +67,7 @@ func (l *AccessLog) Write(e Entry) {
 	// 结构化 key=value：既能人读，也能被 Filebeat / Vector 直接切成字段
 	parts := []string{
 		"ts=" + time.Now().Format("15:04:05.000"),
-		// trace 记**全量**：响应体里给客户端的就是它，只有全长才能直接对齐排查（审计 B8）。
+		// trace 记**全量**：响应体里给客户端的就是它，只有全长才能直接对齐排查。
 		// trace8 是给人眼扫日志用的短前缀，不再是唯一线索。
 		"trace=" + e.TraceID,
 		"trace8=" + Short(e.TraceID),
@@ -143,11 +143,11 @@ type Metrics struct {
 	mu        sync.Mutex
 	requests  map[string]int64      // route|status → 次数
 	latency   map[string][]int64    // route → 最近 N 个延迟(ms)【旧：不可跨实例聚合，保留仅为肉眼对比】
-	durations map[string]*Histogram // route → 耗时直方图（审计 C5，可聚合）
+	durations map[string]*Histogram // route → 耗时直方图（可聚合）
 	limitHits map[string]int64
 	cbTrips   map[string]int64
-	stateErrs map[string]int64 // 共享状态后端判定失败次数（审计 C4，fail-open 兜底）
-	overloads map[string]int64 // 被负载保护拒绝的请求数（审计 C6）
+	stateErrs map[string]int64 // 共享状态后端判定失败次数（fail-open 兜底）
+	overloads map[string]int64 // 被负载保护拒绝的请求数
 
 	// 负载保护的可观测性：上限（配置）与队列长度（运行时），由 gateway 注入
 	overloadLimit int
@@ -204,7 +204,7 @@ func (m *Metrics) IncTrip(service string) {
 	m.mu.Unlock()
 }
 
-// IncStateError 记一次「共享状态后端判定失败」（审计 C4）。
+// IncStateError 记一次「共享状态后端判定失败」。
 //
 // 为什么必须打点：fail-open 的设计是"状态服务挂了就放行"，但**静默放行等于把限流失效藏起来** ——
 // 只有这个计数能让人发现"限流早就没在生效了"。
@@ -214,7 +214,7 @@ func (m *Metrics) IncStateError(backend string) {
 	m.stateErrs[backend]++
 }
 
-// IncOverload 记一次被负载保护拒绝的请求（审计 C6）。
+// IncOverload 记一次被负载保护拒绝的请求。
 func (m *Metrics) IncOverload(route string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -255,7 +255,7 @@ func (m *Metrics) renderOverload() string {
 }
 
 // IncPanic 记一次被兜底捕获的 panic。这类错误以前只走 stderr，
-// /metrics 与 /debug/logs 里完全看不到（审计 P0-2）。
+// /metrics 与 /debug/logs 里完全看不到。
 func (m *Metrics) IncPanic() {
 	m.mu.Lock()
 	m.panics++

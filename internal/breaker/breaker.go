@@ -65,14 +65,14 @@ type Breaker struct {
 	lastTrip time.Time
 
 	// OnTrip 在**本地**跳闸（不是采纳远端状态）时被调用，参数是"打开到什么时候"。
-	// 多副本部署时由 gateway 接上共享状态存储，把这次跳闸发布出去（审计 C4）。
+	// 多副本部署时由 gateway 接上共享状态存储，把这次跳闸发布出去。
 	// ⚠️ 只有一个方向：本地跳闸 → 发布。采纳远端状态时**不**回调，否则两个副本会互相
 	// 转发同一件事，形成发布风暴（A 发布 → B 采纳 → B 又发布 → A 采纳 → …）。
 	OnTrip func(until time.Time)
 }
 
 // OpenUntil 返回"当前打开到什么时候"；未打开时返回零值。
-// 多副本部署时用它把状态发布出去（审计 C4）。
+// 多副本部署时用它把状态发布出去。
 func (b *Breaker) OpenUntil() time.Time {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -82,7 +82,7 @@ func (b *Breaker) OpenUntil() time.Time {
 	return b.openedAt.Add(b.cfg.OpenFor)
 }
 
-// ForceOpenUntil 采纳远端决定的打开状态：在 until 之前一律快速失败（审计 C4）。
+// ForceOpenUntil 采纳远端决定的打开状态：在 until 之前一律快速失败。
 //
 // 实现方式是把 openedAt 往回拨到 `until - OpenFor`，这样：
 //   - 现在 < until 时，冷却判断 `since(openedAt) < OpenFor` 成立 → 继续拒绝；

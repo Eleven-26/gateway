@@ -39,7 +39,7 @@ import (
 
 const (
 	maxTranscodeBody = 1 << 20 // 协议转换读取请求体的上限：1MB
-	maxBodyBytes     = 8 << 20 // 反代链路的请求体上限：8MB —— 流式转发若没有上限，单个请求就能打满上游/磁盘（审计 P0-3）
+	maxBodyBytes     = 8 << 20 // 反代链路的请求体上限：8MB —— 流式转发若没有上限，单个请求就能打满上游/磁盘
 	accessLogKeep    = 200     // 内存中保留的访问日志条数
 	debugLogTail     = 50      // /debug/logs 返回的条数
 )
@@ -51,7 +51,7 @@ const (
 type state struct {
 	cfg            *config.Config
 	router         *router.Router
-	trustedProxies []netip.Prefix // 可信代理网段：只有来自这些地址的请求才采信 XFF/X-Real-IP（审计 P1-3）
+	trustedProxies []netip.Prefix // 可信代理网段：只有来自这些地址的请求才采信 XFF/X-Real-IP
 	authn          *auth.Authenticator
 }
 
@@ -59,9 +59,9 @@ type state struct {
 type Gateway struct {
 	st atomic.Pointer[state] // 配置快照：热重载时原子替换（见 Reload）
 
-	rl       ratelimit.Backend // 限流后端：进程内令牌桶，或共享状态服务（审计 C4）
-	bshare   breaker.Store     // 共享熔断状态（审计 C4）；nil = 单副本语义
-	gate     *overload.Gate    // 负载保护闸门（审计 C6）；nil = 不启用
+	rl       ratelimit.Backend // 限流后端：进程内令牌桶，或共享状态服务
+	bshare   breaker.Store     // 共享熔断状态；nil = 单副本语义
+	gate     *overload.Gate    // 负载保护闸门；nil = 不启用
 	tripCh   chan tripEvent    // 本地跳闸的发布队列（有界，满了丢弃并打点）
 	stop     chan struct{}     // 关闭信号：停掉后台同步协程
 	wg       sync.WaitGroup
@@ -81,7 +81,7 @@ func (g *Gateway) snapshot() *state { return g.st.Load() }
 // newState 由配置构造一份快照：校验 → 解析可信代理 → 编译路由表 → 构造鉴权器。
 // 任何一步失败都不产生半成品，Reload 靠这一点做到「要么全生效、要么完全不变」。
 func newState(cfg *config.Config) (*state, error) {
-	// 启动/重载即校验（审计 P1-1）：错误配置在启动期暴露，而不是等某个请求打进来变成 500
+	// 启动/重载即校验：错误配置在启动期暴露，而不是等某个请求打进来变成 500
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("配置校验失败: %w", err)
 	}
@@ -103,13 +103,15 @@ func newState(cfg *config.Config) (*state, error) {
 
 // New 装配一个网关。熔断器 / 均衡器 / 代理都是**按需惰性创建**并缓存的。
 func New(cfg *config.Config) (*Gateway, error) {
+	// 校验配置 → 解析可信代理 → 编译路由表 → 构造鉴权器，产出一份配置快照。
 	st, err := newState(cfg)
 	if err != nil {
 		return nil, err
 	}
+
 	metrics := observability.NewMetrics()
 	g := &Gateway{
-		// 限流后端按配置选择（审计 C4）：共享状态判定失败要计数，否则 fail-open 会把失效藏起来
+		// 限流后端按配置选择：共享状态判定失败要计数，否则 fail-open 会把失效藏起来
 		rl:        newLimitBackend(cfg, func(error) { metrics.IncStateError("ratelimit") }),
 		grpcPool:  transcode.NewPool(),
 		metrics:   metrics,
@@ -138,7 +140,7 @@ func (g *Gateway) Close() {
 	g.grpcPool.Close()
 }
 
-// newLimitBackend 按配置选择限流后端（审计 C4）：
+// newLimitBackend 按配置选择限流后端：
 // RateLimit.URL 为空 → 进程内令牌桶（默认，单副本语义）；否则 → 共享状态服务。
 //
 // onErr 在共享后端判定失败（超时/连不上/非 2xx）时被调用，用来打 gw_shared_state_errors_total。
@@ -225,7 +227,7 @@ func (w *statusWriter) Flush() {
 	}
 }
 
-// Wrote 报告响应是否已经开始写出。重试判定要用它（审计 C3）：任何已经写出字节的失败
+// Wrote 报告响应是否已经开始写出。重试判定要用它：任何已经写出字节的失败
 // 都不能再换节点重来 —— 客户端已经收到部分内容，重试只会让响应变成两段拼接。
 func (w *statusWriter) Wrote() bool { return w.wrote }
 
@@ -235,7 +237,7 @@ func (w *statusWriter) Wrote() bool { return w.wrote }
 // `http.NewResponseController(rw).Hijack()`（net/http/httputil/reverseproxy.go:838-841），
 // 而 ResponseController 只认 `http.Hijacker` 或 `Unwrap() http.ResponseWriter`
 // （net/http/responsecontroller.go:66-75）。两个都不提供时它返回 ErrNotSupported，
-// 升级请求会被 ErrorHandler 答成 502 —— 即「宣称支持 WebSocket，实际 100% 失败」（审计 P0-1，已实测复现）。
+// 升级请求会被 ErrorHandler 答成 502 —— 即「宣称支持 WebSocket，实际 100% 失败」（已实测复现）。
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // ReadFrom 转发底层的零拷贝路径（sendfile），否则大响应体会退化成用户态缓冲拷贝。
@@ -260,7 +262,7 @@ func fail(w http.ResponseWriter, status int, code, msg, trace string) {
 }
 
 // ---------------------------------------------------------------------------
-// 管理面（独立监听，审计 P1-6）
+// 管理面（独立监听）
 // ---------------------------------------------------------------------------
 
 // AdminHandler 返回管理端点的 handler：`/metrics`、`/debug/logs`、`/readyz`。
@@ -276,7 +278,7 @@ func (g *Gateway) AdminHandler() http.Handler {
 	return mux
 }
 
-// handleMetrics 输出 Prometheus 文本：全局指标 + **节点级**指标（审计 B3）。
+// handleMetrics 输出 Prometheus 文本：全局指标 + **节点级**指标。
 func (g *Gateway) handleMetrics(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	_, _ = io.WriteString(w, g.metrics.Render())
@@ -335,7 +337,7 @@ func (g *Gateway) handleReady(w http.ResponseWriter) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "services": states})
 }
 
-// nodeMetrics 输出节点级指标（审计 B3）：在途、累计失败、是否被摘除。
+// nodeMetrics 输出节点级指标：在途、累计失败、是否被摘除。
 //
 // 这些数字来自均衡器的运行时状态，所以**只有被请求过的服务**才会出现（惰性创建）；
 // 服务名排序输出，保证 /metrics 的文本稳定、可 diff、可断言。
@@ -387,9 +389,10 @@ func (g *Gateway) nodeMetrics() string {
 }
 
 // ServeHTTP 是网关的请求入口。
+// net/http 每收到一个请求，就在连接的 goroutine 里调用 ServeHTTP(w, r)。
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	// 链路上下文（审计 C5）：优先 W3C traceparent，其次兼容 X-Trace-Id，都没有就新生成；
+	// 链路上下文：优先 W3C traceparent，其次兼容 X-Trace-Id，都没有就新生成；
 	// 并为本跳生成 span-id。放进 ctx 是为了让 proxy.Director 能写出正确的 traceparent。
 	tr := observability.StartTrace(r.Header)
 	traceID := tr.TraceID
@@ -398,15 +401,17 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	entry := observability.Entry{TraceID: traceID, SpanID: tr.SpanID, Method: r.Method, Path: r.URL.Path, Host: r.Host}
 	// 整个请求共用这一份快照：热重载只换指针，不会出现「路由用新配置、选节点用旧配置」
 	snap := g.snapshot()
-	// 真实客户端 IP：只有直连对端本身是可信代理时才采信 XFF / X-Real-IP（审计 P1-3）。
+	// 真实客户端 IP：只有直连对端本身是可信代理时才采信 XFF / X-Real-IP。
 	// 只解析一次，限流、日志与「哈希键回落」三处共用，避免口径不一致。
 	clientIP := clientip.Resolve(r.RemoteAddr, r.Header, snap.trustedProxies)
 	entry.ClientIP = clientIP
 
+	// 在线请求数 +1。
 	g.metrics.IncInflight(1)
 
 	// ⑦ 收口：无论从哪个分支返回，这里都会执行一次
 	defer func() {
+		// 在线请求数 -1。
 		g.metrics.IncInflight(-1)
 		entry.Status, entry.Latency, entry.Bytes = sw.status, time.Since(start), sw.bytes
 		// 只在真的取到上游错误时才覆盖 Err —— 否则会把 panic 兜底写下的错误信息抹掉
@@ -421,7 +426,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//
 	// 为什么必须有：net/http 自己在每个连接 goroutine 上有 recover（server.go 的 conn.serve），
 	// 所以 panic 不会让进程崩掉，但客户端只会看到连接被重置（HTTP 000 / curl exit 52），
-	// 而 /metrics 与 /debug/logs 里**什么都留不下** —— 这比崩溃更难排查（本机实测过，审计 P0-2）。
+	// 而 /metrics 与 /debug/logs 里**什么都留不下** —— 这比崩溃更难排查（本机实测过）。
 	defer func() {
 		rec := recover()
 		if rec == nil {
@@ -436,7 +441,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// ===== 管理端点：默认走独立监听的 AdminHandler（审计 P1-6）；
+	// ===== 管理端点：默认走独立监听的 AdminHandler；
 	//        只有配置里没给 AdminListenAddr 时才退回业务端口 =====
 	if snap.cfg.AdminListenAddr == "" {
 		switch r.URL.Path {
@@ -453,6 +458,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ===== ① 路由匹配 =====
+	// 按 Host、Path、Method、Header 匹配，返回路由、匹配原因、路径参数。不匹配直接 404。
 	m, ok := snap.router.Match(r)
 	if !ok {
 		entry.Route = "unmatched"
@@ -462,7 +468,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	entry.Route, entry.MatchWhy = m.Route.Name, m.Reason
 
 	// ===== 请求体上限（放在鉴权之前：明显超限的请求不必再花鉴权/限流的成本）=====
-	// 反代是流式转发的，没有上限就等于允许任意大的请求体打满上游/磁盘（审计 P0-3）。
+	// 反代是流式转发的，没有上限就等于允许任意大的请求体打满上游/磁盘。
 	// 两段式：先按 Content-Length 快速拒绝，再用 MaxBytesReader 兜住 chunked / 谎报长度的情况
 	//（后者只在真正读取时才暴露，由 proxy 映射成 413；必须传原始 w 让 requestTooLarge() 断言生效）。
 	if r.ContentLength > maxBodyBytes {
@@ -473,12 +479,13 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 
+	// self 路由短路，/healthz 这类路由由网关自己处理，不转发。
 	if m.Route.Upstream == "self" {
 		writeJSON(sw, http.StatusOK, map[string]string{"status": "ok", "trace": traceID})
 		return
 	}
 
-	// ===== 负载保护（审计 C6）：并发上限 + 有界排队 =====
+	// ===== 负载保护：并发上限 + 有界排队 =====
 	// 位置刻意选在**路由与 self 之后、鉴权之前**：
 	//   - self 路由（/healthz）不参与保护 —— 负载高时把健康检查也拒了，LB 会把实例摘掉，
 	//     剩下来的实例压力更大，反而加速雪崩；
@@ -507,6 +514,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ===== ② 鉴权 =====
+	// 根据路由的 Auth 策略校验 JWT 或 API Key。
+	// 失败返回 401 或 403。
+	// 成功把身份注入 context。
 	identity, err := snap.authn.Authenticate(r, m.Route.Auth)
 	if err != nil {
 		entry.Err = err.Error()
@@ -518,6 +528,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// ===== ③ 限流（在鉴权之后，才能按用户维度限）=====
 	if p := m.Route.Limit; p.RatePerSec > 0 {
+		// 限流 key = 路由名 + 用户身份 + IP。
 		if allow, retry := g.rl.Allow(ratelimit.Key(m.Route.Name, identity.Subject, clientIP), p); !allow {
 			entry.LimitHit = true
 			g.metrics.IncLimit(m.Route.Name)
@@ -528,6 +539,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 按名字查服务定义，不存在说明配置错误。
 	svc := snap.cfg.Service(m.Route.Upstream)
 	if svc == nil {
 		fail(sw, http.StatusInternalServerError, "bad_config", "上游 "+m.Route.Upstream+" 未定义", traceID)
@@ -535,6 +547,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ===== ③ 熔断检查 =====
+	// 在选节点之前：熔断打开时直接快速失败，不走选节点和转发。
 	cb := g.breakerFor(svc)
 	if err := cb.Allow(); err != nil {
 		st, _, _ := cb.Snapshot()
@@ -546,7 +559,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	st, _, _ := cb.Snapshot()
 	entry.BreakerSt = st.String()
 
-	// Allow 与 Report 必须成对（审计 P2-6）：下面还要经过动态选节点与两条分支，
+	// Allow 与 Report 必须成对：下面还要经过动态选节点与两条分支，
 	// 任何提前 return（乃至 panic）都该算作「这次调用没成功」，用 defer 兜住 ——
 	// 否则半开状态的探测槽位会泄漏，恢复流程可能被永久卡住。
 	breakerReported := false
@@ -556,7 +569,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// ===== ④ 选节点 → ⑤ 协议转换 / ⑥ 反向代理（可重试，审计 C3）=====
+	// ===== ④ 选节点 → ⑤ 协议转换 / ⑥ 反向代理（可重试）=====
 	lb := g.balancerFor(svc)
 	hashKey := ""
 	if svc.HashKeyFrom != "" {
@@ -577,7 +590,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	plan := planRetry(m.Route, r)
 
-	// 上游往返耗时（审计 B8）：覆盖所有尝试，收口时写进访问日志的 upstream_ms
+	// 上游往返耗时：覆盖所有尝试，收口时写进访问日志的 upstream_ms
 	upstreamStart := time.Now()
 	defer func() { entry.UpstreamMs = time.Since(upstreamStart).Milliseconds() }()
 
@@ -642,13 +655,13 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if committed {
 			breakerReported = true
 			cb.Report(healthy)
-			lb.Report(up.Addr, healthy) // 节点级被动摘除：连续失败到阈值就摘掉这个地址（审计 P1-2）
+			lb.Report(up.Addr, healthy) // 节点级被动摘除：连续失败到阈值就摘掉这个地址
 			if st, _, _ := cb.Snapshot(); st != breaker.StateClosed && entry.BreakerSt == breaker.StateClosed.String() {
 				entry.BreakerSt = st.String()
 				g.metrics.IncTrip(svc.Name)
 			}
 			// 这次成功是"重试换节点"换来的：把上一次的错误标成重试痕迹，
-			// 免得日志里出现 `status=200` 却带 `err=` 的迷惑组合（审计 C3）。
+			// 免得日志里出现 `status=200` 却带 `err=` 的迷惑组合。
 			if attempt > 0 && entry.Err != "" {
 				entry.Err = "retried(" + entry.Err + ")"
 			}

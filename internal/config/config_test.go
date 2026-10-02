@@ -31,7 +31,7 @@ func routeByName(c *Config, name string) *Route {
 	return nil
 }
 
-// TestValidate：启动期校验必须把各类错误配置都挡住（审计 P1-1）。
+// TestValidate：启动期校验必须把各类错误配置都挡住。
 // 每一条都对应一种"以前要等到运行期、甚至永远不报错"的配置错误。
 func TestValidate(t *testing.T) {
 	if err := Default().Validate(); err != nil {

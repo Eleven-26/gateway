@@ -8,7 +8,7 @@ import (
 	"gwlab/internal/observability"
 )
 
-// 共享熔断状态（审计 C4）：
+// 共享熔断状态：
 //   - 本地跳闸 → 入队 → 后台协程 POST /breaker 发布；
 //   - 周期性 GET /breaker → 把"别人已经熔断的服务"在本地也置成"打开到 T"。
 //
