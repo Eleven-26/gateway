@@ -21,3 +21,5 @@ coverage.txt
 # Python 缓存（跑 scripts/ 下的脚本会产生）
 __pycache__/
 *.pyc
+
+deploy/config.json

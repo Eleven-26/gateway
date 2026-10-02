@@ -201,10 +201,11 @@ func defaultServices() map[string]*Service {
 		},
 		"order-svc": {
 			Name: "order-svc", Balance: "round_robin",
+			// docker-compose 启动的服务在同一个网络，用服务名。127.0.0.1访问本容器
 			Upstreams: []Upstream{
-				{Addr: "127.0.0.1:19001", Weight: 3, Backend: 1},
-				{Addr: "127.0.0.1:19002", Weight: 1, Backend: 2},
-				{Addr: "127.0.0.1:19003", Weight: 1, Backend: 3},
+				{Addr: "backend-a:19001", Weight: 3, Backend: 1},
+				{Addr: "backend-b:19002", Weight: 1, Backend: 2},
+				{Addr: "backend-c:19003", Weight: 1, Backend: 3},
 			},
 			Timeout: 2 * time.Second,
 			// 节点级被动摘除：连续 3 次 5xx 就摘掉那个节点 5 秒，到期放一个探测
@@ -215,9 +216,9 @@ func defaultServices() map[string]*Service {
 		"user-svc": {
 			Name: "user-svc", Balance: "consistent_hash", HashKeyFrom: "X-User-Id",
 			Upstreams: []Upstream{
-				{Addr: "127.0.0.1:19001", Backend: 1},
-				{Addr: "127.0.0.1:19002", Backend: 2},
-				{Addr: "127.0.0.1:19003", Backend: 3},
+				{Addr: "backend-a:19001", Backend: 1},
+				{Addr: "backend-b:19002", Backend: 2},
+				{Addr: "backend-c:19003", Backend: 3},
 			},
 			Timeout:  2 * time.Second,
 			Ejection: EjectionConfig{FailThreshold: 3, Cooldown: 5 * time.Second},
@@ -229,7 +230,7 @@ func defaultServices() map[string]*Service {
 			// ⚠️ 故意**不配** Ejection：它只有一个节点，摘掉等于没有上游（此时会 fail-open 回退全量），
 			// 这里要演示的是服务级熔断，两者分开看更清楚。
 			Name: "flaky-svc", Balance: "round_robin",
-			Upstreams: []Upstream{{Addr: "127.0.0.1:19003", Backend: 3}},
+			Upstreams: []Upstream{{Addr: "backend-c:19003", Backend: 3}},
 			Timeout:   1 * time.Second,
 			Breaker: BreakerConfig{WindowSize: 10, FailRatio: 0.5, MinRequests: 4,
 				OpenFor: 3 * time.Second, HalfOpenMax: 2},
@@ -240,9 +241,9 @@ func defaultServices() map[string]*Service {
 			//（只 Pick 不 Done 会让计数只增不减 —— 这条链路以前断过，见 AGENTS.md §5）。
 			Name: "slow-svc", Balance: "least_conn",
 			Upstreams: []Upstream{
-				{Addr: "127.0.0.1:19001", Backend: 1},
-				{Addr: "127.0.0.1:19002", Backend: 2},
-				{Addr: "127.0.0.1:19003", Backend: 3},
+				{Addr: "backend-a:19001", Backend: 1},
+				{Addr: "backend-c:19002", Backend: 2},
+				{Addr: "backend-c:19003", Backend: 3},
 			},
 			Timeout:  10 * time.Second, // 要容得下后端的 ?ms= 人为延时
 			Ejection: EjectionConfig{FailThreshold: 3, Cooldown: 5 * time.Second},
@@ -251,7 +252,7 @@ func defaultServices() map[string]*Service {
 		},
 		"grpc-order-svc": {
 			Name: "grpc-order-svc", Balance: "round_robin",
-			Upstreams: []Upstream{{Addr: "127.0.0.1:19100", GRPC: true, Backend: 1}},
+			Upstreams: []Upstream{{Addr: "backend-a:19100", GRPC: true, Backend: 1}},
 			Timeout:   3 * time.Second,
 			Breaker: BreakerConfig{WindowSize: 10, FailRatio: 0.5, MinRequests: 4,
 				OpenFor: 3 * time.Second, HalfOpenMax: 2},

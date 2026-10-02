@@ -1,11 +1,11 @@
 # 演示栈一键起：网关 + 三个演示后端（A 额外开 gRPC）。
 #
 # 用法：
-#   docker compose -f deploy/docker-compose.yml up --build
+#   docker compose -f deploy/docker-compose.yml up -d --build
 #   网关业务端口 http://localhost:18080 ，管理端点 http://localhost:18081
 #
 # ⚠️ 关于网络模式
-#   批次 C1（配置外置）已落地，所以下面用环境变量把监听地址指到 0.0.0.0 即可，**bridge 网络就能直接跑通**：
+#   下面用环境变量把监听地址指到 0.0.0.0 即可，**bridge 网络就能直接跑通**：
 #   `ports:` 映射到容器内 0.0.0.0:18080/18081，宿主机用 localhost:18080 / :18081 访问。
 #   如果不想用环境变量，也可以用 host 网络模式（容器与宿主机共用回环，此时内置的 127.0.0.1 直接可用）。
 
@@ -17,11 +17,13 @@ services:
     image: gateway:dev
     command: ["/app/gateway"]
     environment:
-      # 批次 C1 的注入点：不设则退回内置的 127.0.0.1:18080 / :18081（容器里就访问不到了）
+      # 不设则退回内置的 127.0.0.1:18080 / :18081（容器里就访问不到了）
       GW_LISTEN_ADDR: "0.0.0.0:18080"
       GW_ADMIN_LISTEN_ADDR: "0.0.0.0:18081"
       # 可选：挂一份 JSON 配置（覆盖语义）。挂载示例见文件末尾注释。
-      # GW_CONFIG: "/etc/gateway/config.json"
+      GW_CONFIG: "/etc/gateway/config.json"
+    volumes:
+      - ./config.json:/etc/gateway/config.json:ro
     ports:
       - "18080:18080"   # 业务入口
       - "18081:18081"   # 管理端点（/metrics、/debug/logs、/readyz）—— 生产只应绑内网

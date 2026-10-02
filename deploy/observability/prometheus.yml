@@ -1,4 +1,4 @@
-# Prometheus 抓取配置：只抓管理端口的 /metrics（业务端口从批次 B4 起不再提供）。
+# Prometheus 抓取配置：只抓管理端口的 /metrics
 global:
   scrape_interval: 5s
   evaluation_interval: 5s
@@ -9,7 +9,7 @@ scrape_configs:
     static_configs:
       # host 网络模式（Docker Desktop / Linux）下用 127.0.0.1；
       # bridge 网络或 k8s 里改成服务名，例如 gateway:18081 / gateway-admin.monitoring.svc:18081
-      - targets: ["127.0.0.1:18081"]
+      - targets: ["gateway:18081"]
         labels:
           instance: gateway-local
 
