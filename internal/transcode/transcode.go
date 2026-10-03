@@ -28,6 +28,7 @@ import (
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
 
+	"gwlab/internal/clientip"
 	"gwlab/internal/config"
 )
 
@@ -158,6 +159,12 @@ func (p *Pool) Close() {
 	p.conns = map[string]*grpc.ClientConn{}
 }
 
+// MetadataClientIP 是网关往 gRPC metadata 里写真实客户端 IP 用的键。
+//
+// 与 HTTP 侧写出的 X-Real-IP 语义相同（metadata 的键会被规范成小写，所以这里直接写小写）。
+// 值取自入口 clientip.Resolve 的解析结果（经 context 传下来），**不是**从对端地址推的。
+const MetadataClientIP = "x-real-ip"
+
 // Transcode 把一次 HTTP 请求翻译成 gRPC 调用，并把结果转回 JSON。
 //
 // 映射规则（REST → gRPC）：
@@ -184,10 +191,21 @@ func Transcode(ctx context.Context, pool *Pool, up *config.Upstream, t *config.T
 		req[fmt.Sprintf("param%d", i+1)] = g
 	}
 
-	// 只透传白名单 metadata，避免把 Cookie / User-Agent 之类塞进 gRPC 头
-	if len(hdr) > 0 {
-		kv := make([]string, 0, len(hdr)*2)
-		for k, v := range hdr {
+	// 只透传白名单 metadata，避免把 Cookie / User-Agent 之类塞进 gRPC 头。
+	// 先拷一份再补，不改调用方传进来的 map。
+	md := make(map[string]string, len(hdr)+1)
+	for k, v := range hdr {
+		md[k] = v
+	}
+	// 真实客户端 IP：与 HTTP 转发路径**同源** —— 只取入口 clientip.Resolve 挂在 ctx 上的结果
+	// （与 proxy.Director 写 X-Real-IP 用的是同一个值）。⚠️ 别在这里从对端地址推，
+	// 否则同一个请求在 gRPC 与 HTTP 两条路上会给上游两个口径。
+	if ip, ok := clientip.FromClient(ctx); ok {
+		md[MetadataClientIP] = ip
+	}
+	if len(md) > 0 {
+		kv := make([]string, 0, len(md)*2)
+		for k, v := range md {
 			kv = append(kv, strings.ToLower(k), v)
 		}
 		ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs(kv...))

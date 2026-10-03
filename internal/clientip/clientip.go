@@ -29,6 +29,7 @@
 package clientip
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -114,6 +115,32 @@ func Resolve(remoteAddr string, h http.Header, trusted []netip.Prefix) string {
 
 	// ⑤ 兜底：对端自己（它本身是可信代理）。
 	return peer.String()
+}
+
+// clientKey 是本包挂在 context 上的私有键。
+// 用空结构体而不是字符串，避免与其它包的同名键撞车。
+type clientKey struct{}
+
+// WithClient 把「入口解析出来的真实客户端 IP」挂到 ctx 上。
+//
+// 为什么需要它：出口（proxy.Director 写 X-Real-IP）**不能**再从 RemoteAddr 推 ——
+// 那是入站时的直接对端，网关在 LB 后面时它就是 LB 的地址，
+// 于是入口刚解出来的真实客户端会在出口被写回成代理地址（同一个错误的第二次出现）。
+// 入口解析一次、出口按 ctx 复用，整条链路才只有一个口径。
+//
+// ip 为空时原样返回 ctx（不挂空值），这样 FromClient 的语义只有「有 / 没有」两种。
+func WithClient(ctx context.Context, ip string) context.Context {
+	if ip == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, clientKey{}, ip)
+}
+
+// FromClient 取出入口解析的客户端 IP；第二个返回值为 false 表示本请求没挂过
+// （例如直接调用 proxy 包、或在测试里手工构造的请求）。
+func FromClient(ctx context.Context) (string, bool) {
+	ip, ok := ctx.Value(clientKey{}).(string)
+	return ip, ok && ip != ""
 }
 
 // parseChain 把 X-Forwarded-For 拆成有序地址列表（左 → 右）。

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"gwlab/internal/auth"
+	"gwlab/internal/clientip"
 	"gwlab/internal/config"
 	"gwlab/internal/observability"
 )
@@ -112,8 +113,12 @@ func New(upstream *config.Upstream, stripPrefix string) *Proxy {
 			//
 			// ⚠️ 注意：入站 XFF 并不会被清理，因此 XFF 可以伪造（「客户端值, 网关IP」）。
 			// 取真实客户端 IP 必须用 X-Real-IP。
-			clientIP, _, _ := net.SplitHostPort(req.RemoteAddr)
-			req.Header.Set("X-Real-IP", clientIP)
+			//
+			// ⚠️⚠️ 但 X-Real-IP **写谁**不能从 RemoteAddr 推：它是**入站时的直接对端**，
+			// 网关在 LB 后面时那就是 LB 的地址 —— 入口刚用 clientip.Resolve 解出的真实客户端，
+			// 会在出口被写回成代理。所以优先用入口挂到 ctx 上的解析结果（clientip.WithClient），
+			// 只有 ctx 里没有时（直接调用本包 / 测试）才退回 RemoteAddr。
+			req.Header.Set("X-Real-IP", clientIPOf(req))
 			req.Header.Set("X-Forwarded-Host", req.Host)
 			req.Header.Set("X-Forwarded-Proto", scheme(req))
 
@@ -220,6 +225,24 @@ func deferred(r *http.Request) bool {
 }
 
 type deferredKey struct{}
+
+// clientIPOf 取要写进 X-Real-IP 的地址。
+//
+// 优先用入口（gateway.ServeHTTP）解析好并挂到 ctx 上的真实客户端 IP —— 那是唯一
+// 考虑过「对端是否可信、XFF 链怎么走」的结论；ctx 里没有时才退回 RemoteAddr
+// （直接调用本包、或测试里手工构造的请求走这一支）。
+//
+// 退回时按「主机部分」取（剥端口）；SplitHostPort 失败则整串当主机 ——
+// 这样无端口的 "1.2.3.4" 不会写出一个空值，而 IPv6 的 "[::1]:1234" 也能剥对。
+func clientIPOf(req *http.Request) string {
+	if ip, ok := clientip.FromClient(req.Context()); ok {
+		return ip
+	}
+	if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+		return host
+	}
+	return req.RemoteAddr
+}
 
 // markErr 记录本次转发的错误（ErrorHandler 里调用；context 能穿过 Clone，Header 不能）。
 func markErr(r *http.Request, msg string) {

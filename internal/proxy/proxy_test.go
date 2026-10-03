@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"gwlab/internal/clientip"
 	"gwlab/internal/config"
 )
 
@@ -121,5 +122,52 @@ func TestInternalHeadersStripped(t *testing.T) {
 		if got := echoOf(res, h); got == "" {
 			t.Errorf("网关重写的 %s 不该被剥掉，实际为空", h)
 		}
+	}
+}
+
+// TestRealIPFromContext 盯住「出口写 X-Real-IP 用入口解析好的地址」。
+//
+// 为什么必须有这条：网关在 LB 后面时入站 RemoteAddr 是 LB，若从它推，
+// 入口刚用 clientip.Resolve 解出来的真实客户端会在出口被写回成代理地址 ——
+// 上游按 IP 限流/审计时看到的又是 LB，问题只是换了个位置复发。
+func TestRealIPFromContext(t *testing.T) {
+	up := newEchoUpstream(t)
+	p := New(&config.Upstream{Addr: upstreamAddr(up)}, "")
+
+	cases := []struct {
+		name       string
+		remoteAddr string
+		ctxIP      string // "" = 不挂 ctx；"(empty)" = 挂一个空值
+		want       string
+	}{
+		{"ctx 有解析结果 → 用它，而不是 RemoteAddr", "10.0.1.5:5000", "9.9.9.9", "9.9.9.9"},
+		{"客户端是 IPv6 → 原样写出", "10.0.1.5:5000", "2001:db8::1", "2001:db8::1"},
+		{"ctx 没挂过 → 退回 RemoteAddr 的主机部分", "10.0.1.5:5000", "", "10.0.1.5"},
+		{"ctx 挂的是空值 → 同样退回（WithClient 不挂空值）", "10.0.1.5:5000", "(empty)", "10.0.1.5"},
+		{"RemoteAddr 无端口 → 整串当主机，不能写出空值", "10.0.1.5", "", "10.0.1.5"},
+		{"RemoteAddr 是 IPv6 方括号形式 → 剥掉方括号与端口", "[::1]:5000", "", "::1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/order/1", nil)
+			req.RemoteAddr = tc.remoteAddr
+			switch tc.ctxIP {
+			case "":
+				// 什么都不挂：走「直接调用本包」那一支
+			case "(empty)":
+				req = req.WithContext(clientip.WithClient(req.Context(), ""))
+			default:
+				req = req.WithContext(clientip.WithClient(req.Context(), tc.ctxIP))
+			}
+
+			w := httptest.NewRecorder()
+			p.ServeHTTP(w, req)
+			res := w.Result()
+			defer res.Body.Close()
+
+			if got := echoOf(res, "X-Real-IP"); got != tc.want {
+				t.Errorf("上游看到的 X-Real-IP = %q，期望 %q", got, tc.want)
+			}
+		})
 	}
 }

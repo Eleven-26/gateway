@@ -117,11 +117,17 @@ func (o orderImpl) CreateOrder(ctx context.Context, req *map[string]any) (*map[s
 	if v := md.Get("x-trace-id"); len(v) > 0 {
 		trace = v[0]
 	}
+	// 与 HTTP 侧的回显对齐：网关把真实客户端 IP 放在 x-real-ip（见 transcode.MetadataClientIP）
+	clientIP := ""
+	if v := md.Get("x-real-ip"); len(v) > 0 {
+		clientIP = v[0]
+	}
 	return &map[string]any{
 		"order_id":    fmt.Sprintf("SO-%s-%04d", time.Now().Format("20060102"), time.Now().UnixNano()%10000),
 		"accepted_by": o.name,
 		"received":    *req,
 		"trace":       trace,
+		"client_ip":   clientIP,
 		"protocol":    "gRPC over HTTP/2 (json codec)",
 	}, nil
 }

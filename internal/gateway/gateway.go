@@ -405,6 +405,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 只解析一次，限流、日志与「哈希键回落」三处共用，避免口径不一致。
 	clientIP := clientip.Resolve(r.RemoteAddr, r.Header, snap.trustedProxies)
 	entry.ClientIP = clientIP
+	// 同时挂到 ctx 上：出口（proxy.Director 写 X-Real-IP）也从这里取同一个值 ——
+	// 出站侧若再从 RemoteAddr 推，写出去的就是**直接对端（代理）**的地址，
+	// 等于把入口刚解出来的真实客户端又换回成 LB。
+	r = r.WithContext(clientip.WithClient(r.Context(), clientIP))
 
 	// 在线请求数 +1。
 	g.metrics.IncInflight(1)

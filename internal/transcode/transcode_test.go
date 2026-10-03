@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 
+	"gwlab/internal/clientip"
 	"gwlab/internal/config"
 )
 
@@ -245,7 +246,11 @@ func echoHandler(_ any, ctx context.Context, dec func(any) error,
 		return nil, err
 	}
 	md, _ := metadata.FromIncomingContext(ctx)
-	return map[string]any{"echo": in, "x_trace_id": md.Get("x-trace-id")}, nil
+	return map[string]any{
+		"echo":       in,
+		"x_trace_id": md.Get("x-trace-id"),
+		"x_real_ip":  md.Get(MetadataClientIP),
+	}, nil
 }
 
 // TestTranscodeEndToEnd 是一条真正的端到端用例：起一个最小 gRPC 服务（注册 json codec 的
@@ -297,5 +302,57 @@ func TestTranscodeEndToEnd(t *testing.T) {
 	ids, ok := out["x_trace_id"].([]any)
 	if !ok || len(ids) != 1 || ids[0] != "trace-abc" {
 		t.Errorf("metadata 白名单应透传 x-trace-id，实际 %#v", out["x_trace_id"])
+	}
+}
+
+// TestTranscodeCarriesClientIP 盯住「gRPC 转码这条路也要把真实客户端 IP 带给上游」：
+// 值只从 ctx 里取（入口 clientip.Resolve 的解析结果），与 HTTP 转发路径同源 ——
+// 否则同一个请求经 HTTP 出去带的是真实客户端、经 gRPC 出去什么都没有，上游两个口径。
+func TestTranscodeCarriesClientIP(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("监听失败: %v", err)
+	}
+	srv := grpc.NewServer()
+	srv.RegisterService(&grpc.ServiceDesc{
+		ServiceName: "order.OrderService",
+		HandlerType: (*testEcho)(nil),
+		Methods: []grpc.MethodDesc{{
+			MethodName: "CreateOrder",
+			Handler:    echoHandler,
+		}},
+	}, struct{}{})
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(srv.Stop)
+
+	p := NewPool()
+	defer p.Close()
+
+	pol := &config.TranscodePolicy{Service: "order.OrderService", Method: "CreateOrder"}
+	cases := []struct {
+		name string
+		ctx  context.Context
+		want []string // 上游应看到的 x-real-ip（nil = 不该出现）
+	}{
+		{"ctx 里有解析结果 → 带给上游", clientip.WithClient(context.Background(), "9.9.9.9"), []string{"9.9.9.9"}},
+		{"ctx 里没有 → 不塞这个键（不能瞎猜一个地址）", context.Background(), nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Transcode(tc.ctx, p, &config.Upstream{Addr: ln.Addr().String()}, pol,
+				[]byte(`{"sku":"A-1"}`), nil, nil)
+			if err != nil {
+				t.Fatalf("Transcode 失败: %v", err)
+			}
+			got, _ := out["x_real_ip"].([]any)
+			if len(got) != len(tc.want) {
+				t.Fatalf("上游看到的 x-real-ip = %#v，期望 %#v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("x-real-ip[%d] = %v，期望 %v", i, got[i], tc.want[i])
+				}
+			}
+		})
 	}
 }
