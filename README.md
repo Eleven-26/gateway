@@ -36,8 +36,10 @@ TraceID → ① 路由 → ② 鉴权 → ③ 限流 → ③ 熔断 → ④ 选�
 │   └── gateway/                装配层：把上面七个模块接成一条流水线
 │                               + 热重载（reload.go）/ 重试（retry.go）/ 共享状态（sharedstate.go）
 ├── scripts/                    压测与演练脚本（loadtest.py 压测 / demo_faults.py 故障演练 / demo_reload.py 热重载验收）
-├── deploy/                     部署件：docker-compose.yml（含 statestore）、config.example.json、k8s/*.yaml、observability/*
-├── Dockerfile                  多阶段构建镜像
+├── deploy/                     部署件：docker-compose.yml（含 statestore）、config.example.json 模板 +
+│                               config.compose.json（演示栈实际加载的那份）、.env.example（密钥模板）、
+│                               k8s/{gateway,backend,statestore}.yaml、observability/*
+├── Dockerfile                  多阶段构建镜像（gateway/backend/statestore/hashring 进同一镜像）
 ├── .github/workflows/          CI（ci.yml：gofmt 卡口 + vet + go test -race + 三入口构建 + 基准记录）
 ├── docs/                       文档
 │   ├── 项目地图.md               文件/依赖/链路/配置/改动定位的行号级索引（先看这份）
@@ -331,9 +333,11 @@ LB 会把实例摘走，剩下的实例压力更大，反而加速雪崩；而�
   `order-svc` 的权重 `3:1:1`（算法是 `round_robin`）都不生效。
 - **无配置中心**：只有「文件 + 环境变量」，没有 etcd / Nacos 之类的下发与版本化；
   且改 `shared_state` 或 `listen_addr` / `admin_listen_addr` 仍需重启（热重载只换配置快照）。
-- **容器 / k8s 未在真实 daemon / 集群验证**（本机 Docker daemon 未启动）：
-  `Dockerfile`、`deploy/docker-compose.yml`、`deploy/k8s/*.yaml` 已就位，但只做过静态核对。
-- **压测报告文档缺**：`scripts/loadtest.py` 与 CI 基准记录已有，但没有成篇的容量 / 拐点报告。
+- **k8s 清单未在真实集群验证**（compose 演示栈已在 Docker Desktop 实测跑通，两处部署即坏的坑已修：
+  镜像缺 `statestore` 二进制、compose 用 `command` 覆盖入口被 `ENTRYPOINT` 追加）：
+  `deploy/k8s/*.yaml` 只做过离线结构核对，本机没启用 Docker Desktop 的 Kubernetes。详见 `docs/生产部署与接入新服务.md` §4。
+- **限流阈值改了不刷新已存在的令牌桶**：`Bucket(key, p)` 命中旧桶就原样返回，新 `rate/burst` 要等空闲 3 分钟
+  GC 或进程（含 `statestore`）重启才生效 —— 容器里热重载后「限流数字看着没变」就是它。
 - **P2 剩余项**：API Key 仍支持 `?api_key=` query 传参（会进浏览器历史 / Referer / 上游日志）；
   无 `iss` / `aud` 校验、无 RS256/JWKS、无密钥轮换与吊销；`/metrics` 与 `/debug/logs` 自身无鉴权
   （靠「管理端口只对内网开放」兜住）。
@@ -342,7 +346,7 @@ LB 会把实例摘走，剩下的实例压力更大，反而加速雪崩；而�
 [`docs/生产部署与接入新服务.md`](docs/生产部署与接入新服务.md)。
 
 > 本列表只记项目自身在 `docs/项目分析与执行链路.md` 第 8 节列出的缺口。完整的独立审计
-> （P0/P1/P2 与对标标准网关的能力矩阵）见 [`docs/网关缺陷审计与优化路线.md`](docs/网关缺陷审计与优化路线.md)；
+> （P0/P1/P2 与对标标准网关的能力矩阵）见 [`docs/网关缺陷审计与优化路线.md`](.workbuddy/tmp/网关缺陷审计与优化路线.md)；
 > 其中 5 条 P0 已于批次 A 修复，**批次 B 的 9 条 P1 + 3 条 P2 也已修复**（管理面独立监听、启动期配置校验、
 > 节点级被动摘除、可信代理真实 IP、非阻塞拨号、头值正则预编译、节点级指标、访问日志全量 trace、三处加固）；
 > **批次 C（C1~C6）也已全部实现并验证**（配置外置 + 热重载、上游 TLS、每路由超时 + 重试、共享状态服务、

@@ -19,9 +19,11 @@
    `config / router / auth / ratelimit / breaker / overload / balancer / clientip / transcode / proxy / observability / gateway`
    （`overload` 是批次 C6 新增的负载保护包）。
    仓库另有 `scripts/`（压测与演练脚本：`loadtest.py` 纯标准库压测、`demo_faults.py` 故障演练、
-   `demo_reload.py` 热重载验收）、`deploy/`（`docker-compose.yml`（含 `statestore`）、可直接加载的
-   `config.example.json`、`k8s/{gateway,statestore}.yaml`、`observability/{prometheus.yml,grafana-dashboard.json}`）、
-   根目录 `Dockerfile`（多阶段构建）与
+   `demo_reload.py` 热重载验收）、`deploy/`（`docker-compose.yml`（含 `statestore`，可观测栈走 `--profile observability`）、
+   外部配置模板 `config.example.json` 与可直接跑的演示配置 `config.compose.json`（upstream 用 compose 服务名）、
+   `.env.example`（compose 变量插值模板；真实的 `deploy/.env` 不进仓库）、
+   `k8s/{gateway,backend,statestore}.yaml`、`observability/{prometheus.yml,grafana-dashboard.json}`）、
+   根目录 `Dockerfile`（多阶段构建，四个入口进同一镜像）与 `.dockerignore`、
    `.github/workflows/`（CI：gofmt 卡口 + vet + `-race` + 三入口构建 + 基准记录）。
 2. **仓库内不放编译产物**：`bin/`、`*.exe`、`*.exe~`、`*.log` 均已进 `.gitignore`。产物统一 `make build` 到 `bin/`。
 3. **依赖方向单向**，改代码时不要引入反向依赖：
@@ -148,6 +150,16 @@
 - `go vet ./...` 前台执行偶发 SIGTERM，长命令统一后台跑。
 - **`go test -race` 在本机不可用**：`CGO_ENABLED=0` 且无 gcc，报 `-race requires cgo`；
   竞态检测只能放 CI（Linux）。
+- **本机 Docker Desktop 可用**（daemon 29.7.2），`deploy/docker-compose.yml` 已实测跑通，但 **k8s 仍未在真集群验证过**
+  （Docker Desktop 的 Kubernetes 未启用，启用要重启 Docker）。改 `deploy/k8s/*.yaml` 时只能做离线结构核对。
+- **gcr.io 在本机不可达**：构建镜像要换基镜像源 —— `docker build --build-arg RUNTIME_IMAGE=gcr.nju.edu.cn/distroless/static-debian12:nonroot -t gateway:dev .`
+  （compose 里对应 `deploy/.env` 的 `RUNTIME_IMAGE`；`docker.io` 上的 distroless 仓库不在镜像站白名单里，gcr 镜像站走 `gcr.nju.edu.cn`）。
+- **容器里换可执行文件要用 `entrypoint`，不是 `command`**：镜像 `ENTRYPOINT ["/app/gateway"]`，compose 的 `command`
+  只会**追加**参数（`/app/gateway /app/backend -http …` → 表现为「容器 Up 但端口没人听 / upstream refused」）；
+  k8s 反过来，`command` 覆盖 ENTRYPOINT、`args` 追加参数。
+- **distroless/static 镜像没有 shell 也没有 curl**：compose 的 `healthcheck` 因此没法探 HTTP，
+  别写 `["CMD", "/app/backend", "-h"]` 这种恒为 0 的假检查（Go flag 包对未定义的 `-h` 返回 0）。
+  就绪判定交给 k8s httpGet 探针或宿主机 curl。
 
 ## 4. 生产口径与上线红线
 
@@ -210,8 +222,13 @@
   （算法是 `round_robin`）都不生效。
 - **无配置中心**：只有「文件 + 环境变量」，没有 etcd / Nacos 之类的下发与版本化；
   改 `SharedState.URL` / `ListenAddr` 仍需重启。
-- **容器 / k8s 未在真实 daemon / 集群验证**（本机 Docker daemon 未启动）：`Dockerfile`、
-  `deploy/docker-compose.yml`、`deploy/k8s/*.yaml` 已就位，但只做过静态核对。
+- **容器已实测、k8s 清单仍未在真集群跑过**：`Dockerfile`（补上了 `statestore` 构建与 `.dockerignore`）、
+  `deploy/docker-compose.yml`（改用 `entrypoint`、挂载可跟踪的 `config.compose.json`、去掉假 healthcheck、
+  可观测栈改 profile）与 `deploy/k8s/{gateway,backend,statestore}.yaml`（Secret + ConfigMap 注入）
+  已在 Docker Desktop 实测通过（证据见 `docs/生产部署与接入新服务.md` §3.3）；
+  `deploy/k8s/*.yaml` 只做过离线结构核对（本机没有可用集群）。
+- **限流阈值改了不立刻生效**：`ratelimit.Limiter.Bucket` 命中已有 key 直接返回旧桶、**不刷新策略**，
+  新 `rate/burst` 要等该桶空闲满 3 分钟被 GC、或进程（含 `statestore`）重启后才生效。
 - **压测报告已补**（D4）：`docs/性能压测报告.md` —— 基线 2077（`/healthz`）/ 1359（`/slow?ms=5`）RPS、
   并发拐点 c≈20、共享限流判定代价 ≈64%、闸门开销在噪声内；并记录了「压测工具不复用连接 → Windows
   临时端口耗尽 → 数字自相矛盾」的教训。CI 里的基准记录见 `.github/workflows/ci.yml`。

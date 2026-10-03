@@ -1,0 +1,143 @@
+# 演示后端的 k8s 清单（三个替身上游）：只为让 k8s 路径**独立可跑通**，生产里由真实业务服务顶替。
+#
+# 服务名刻意与 deploy/config.compose.json 里的 upstream 地址一致（backend-a:19001 / backend-b:19002 /
+# backend-c:19003 / backend-a:19100），所以 compose 与 k8s 用**同一份配置文件**，改拓扑只改一处。
+#
+# 用法：
+#   kubectl apply -f deploy/k8s/backend.yaml
+#   kubectl apply -f deploy/k8s/gateway.yaml
+#   kubectl -n default port-forward svc/gateway 18080:80     # 从宿主机打业务口
+#   curl --noproxy '*' http://127.0.0.1:18080/api/order/list  # 反复打，看 backend 字段在 A/B/C 间轮转
+#
+# ⚠️ 与 compose 那份的差别只在「怎么写命令行」：
+#   容器运行时里 ENTRYPOINT 是 /app/gateway，k8s 的 `command` 覆盖 ENTRYPOINT、`args` 追加参数，
+#   所以这里必须写 command: ["/app/backend"]（写成 args 会变成 `/app/gateway /app/backend ...`，
+#   表现为"Pod Running 但端口没人听"）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-a
+  labels:
+    app: backend-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-a
+  template:
+    metadata:
+      labels:
+        app: backend-a
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532 # distroless nonroot
+        readOnlyRootFilesystem: true
+      containers:
+        - name: backend
+          image: gateway:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/backend"]
+          # 演示后端绑 0.0.0.0 是靠 flag（不是环境变量注入点）；-name 会回显在响应里，用来观测落点
+          args: ["-http", "0.0.0.0:19001", "-grpc", "0.0.0.0:19100", "-name", "A"]
+          ports:
+            - containerPort: 19001
+            - containerPort: 19100
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-a
+spec:
+  selector:
+    app: backend-a
+  ports:
+    - name: http
+      port: 19001
+      targetPort: 19001
+    - name: grpc
+      port: 19100
+      targetPort: 19100
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-b
+  labels:
+    app: backend-b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-b
+  template:
+    metadata:
+      labels:
+        app: backend-b
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        readOnlyRootFilesystem: true
+      containers:
+        - name: backend
+          image: gateway:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/backend"]
+          args: ["-http", "0.0.0.0:19002", "-name", "B"]
+          ports:
+            - containerPort: 19002
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-b
+spec:
+  selector:
+    app: backend-b
+  ports:
+    - name: http
+      port: 19002
+      targetPort: 19002
+---
+# 演示后端 C：`/__control?fail=1`（置为恒 500，演熔断与节点摘除）与 `?ms=`（人为延时，演 least_conn）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-c
+  labels:
+    app: backend-c
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-c
+  template:
+    metadata:
+      labels:
+        app: backend-c
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        readOnlyRootFilesystem: true
+      containers:
+        - name: backend
+          image: gateway:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/backend"]
+          args: ["-http", "0.0.0.0:19003", "-name", "C"]
+          ports:
+            - containerPort: 19003
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-c
+spec:
+  selector:
+    app: backend-c
+  ports:
+    - name: http
+      port: 19003
+      targetPort: 19003

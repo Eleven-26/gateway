@@ -1,12 +1,32 @@
 # 网关的 k8s 清单：Deployment + 业务/管理两个 Service + Ingress + PDB + 管理面 NetworkPolicy。
 #
-# 用法：
-#   kubectl apply -f deploy/k8s/gateway.yaml
-#   kubectl apply -f deploy/k8s/servicemonitor.yaml   # 可选，需要 Prometheus Operator CRD
+# 用法（四步，前两步是本清单的**前置**，缺任何一个 Pod 都会 CrashLoopBackOff）：
+#   1) 构建镜像并让集群能拉到它
+#        docker build -t gateway:dev .
+#      · Docker Desktop 的内置 k8s / kind：镜像在同一台 Docker 里，建好即可用（把下面的 image 改成 gateway:dev，
+#        imagePullPolicy 保持 IfNotPresent）；minikube 用 `minikube image load gateway:dev`。
+#      · gcr.io 不可达时换基镜像：`docker build --build-arg RUNTIME_IMAGE=gcr.nju.edu.cn/distroless/static-debian12:nonroot -t gateway:dev .`
+#   2) 配置与密钥（清单里 GW_CONFIG 指向 /etc/gateway/config.json，密钥从 Secret 取）
+#        kubectl create configmap gateway-config --from-file=config.json=deploy/config.compose.json
+#        kubectl create secret generic gateway-secrets \
+#          --from-literal=jwt-secret="$(openssl rand -hex 32)" \
+#          --from-literal=api-key="ak_live_$(openssl rand -hex 8)"
+#      演示时想连上游后端一起起：再 `kubectl apply -f deploy/k8s/backend.yaml`（服务名 backend-a/b/c，
+#      与那份 JSON 里的 upstream 地址正好对上，两条部署路径共用同一份配置）。
+#   3) kubectl apply -f deploy/k8s/gateway.yaml
+#   4) （可选）抓指标：有 Prometheus Operator 就自建 ServiceMonitor 指到 Service `gateway-admin` 的
+#      18081 端口；没有 Operator 就照 deploy/observability/prometheus.yml 的写法把 target 改成
+#      gateway-admin.<namespace>.svc:18081。
+#
+# 改配置：`kubectl create configmap gateway-config --from-file=... --dry-run=client -o yaml | kubectl apply -f -`
+# —— kubelet 同步挂载文件（默认约 1 分钟）后，网关自己的 3 秒 mtime 轮询会热重载；
+# 但 `listen_addr` / `admin_listen_addr` / `shared_state` / `overload` 改了必须重启 Pod（监听已绑定、
+# 限流后端与闸门在启动时构造）。
 #
 # ⚠️ 两个与代码强相关的约束，别照抄改坏：
 #   1. `replicas: 1` —— 限流桶、熔断器、节点摘除状态**都在进程内**（AGENTS.md §5）。
-#      多副本会让限流阈值变成 N 倍、熔断与摘除各算各的；要扩副本必须先做 C4（共享状态）。
+#      多副本会让限流阈值变成 N 倍、熔断与摘除各算各的；要扩副本必须先配 `shared_state`
+#      （`deploy/k8s/statestore.yaml`，并把配置里的 `shared_state.url` 指到 http://statestore:18090）。
 #   2. readiness 用**管理端口**的 `/readyz`（它会检查熔断状态与"所有节点是否被摘除"），
 #      liveness 用业务端口的 `/healthz`（只代表进程活着）。两者语义不同，别混用。
 apiVersion: apps/v1
@@ -31,7 +51,7 @@ spec:
         readOnlyRootFilesystem: true
       containers:
         - name: gateway
-          image: gateway:latest
+          image: gateway:dev # ← 换成你的镜像地址；本地集群构建的镜像配 imagePullPolicy: IfNotPresent
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -39,18 +59,36 @@ spec:
             - name: admin
               containerPort: 18081
           env:
-            # 批次 C1（配置外置）已落地：这两个注入点会把监听地址改到 0.0.0.0，
-            # 否则容器里绑的是源码默认的 127.0.0.1，Service 转发不到。
+            # 这两个注入点把监听地址改到 0.0.0.0，否则容器里绑的是源码默认的 127.0.0.1，Service 转发不到。
             - name: GW_LISTEN_ADDR
               value: "0.0.0.0:18080"
             - name: GW_ADMIN_LISTEN_ADDR
               value: "0.0.0.0:18081"
-            # 也可以挂一份 JSON 配置（覆盖语义：只写要改的字段）：
-            #   GW_CONFIG: /etc/gateway/config.json  + 下面 volumes 挂 ConfigMap
-            # 网关在 LB/Ingress 后面时必填：只有来自这些网段的请求才采信 XFF / X-Real-IP
-            # （批次 B5 的 clientip；留空表示谁都不信，限流维度会退化成 Ingress 的地址）
+            # 配置外置：文件来自下面的 ConfigMap 挂载（覆盖语义 —— routes/services 写了就整体替换）。
+            # ⚠️ GW_CONFIG 指向的路径读不到 = **启动失败**（ConfigMap 没建就是这种现象）。
+            # 不想挂文件就把这两行删掉，退回编译期默认值 + 环境变量。
+            - name: GW_CONFIG
+              value: /etc/gateway/config.json
+            # 密钥只走 Secret，不进 ConfigMap、不进镜像、不进 Git。
+            - name: GW_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: jwt-secret
+            - name: GW_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: api-key
+            # 网关在 LB/Ingress 后面时必填：只有来自这些网段的请求才采信 XFF / X-Real-IP。
+            # 留空表示谁都不信（最安全），后果是限流维度退化成 Ingress 的地址 —— 所有客户端共用一个桶。
+            # 值要按集群实际网段改（kubelet Pod CIDR / 上游 CDN 回源段），别照抄 10.0.0.0/8。
             - name: GW_TRUSTED_PROXIES
               value: "10.0.0.0/8"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/gateway
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /healthz
@@ -73,6 +111,12 @@ spec:
             limits:
               cpu: "1"
               memory: 256Mi
+      volumes:
+        # 挂载后目录里出现 /etc/gateway/config.json（key 名 = 文件名）。
+        # ConfigMap 内容变了，kubelet 会更新这个文件，网关自己的 3 秒 mtime 轮询随即热重载。
+        - name: config
+          configMap:
+            name: gateway-config
 ---
 # 业务入口：只暴露 18080
 apiVersion: v1
@@ -89,7 +133,7 @@ spec:
       port: 80
       targetPort: http
 ---
-# 管理端点：**不要**挂 Ingress、不要开 NodePort —— /metrics、/debug/logs 没有鉴权（AGENTS.md §4）。
+# 管理端点：**不要**挂 Ingress、不要开 NodePort —— /metrics、/debug/logs、/readyz 都没有鉴权（AGENTS.md §4）。
 # 集群内抓取用这个 ClusterIP，再用下面的 NetworkPolicy 限定来源。
 apiVersion: v1
 kind: Service
@@ -106,6 +150,13 @@ spec:
       port: 18081
       targetPort: admin
 ---
+# 管理面隔离：/metrics、/debug/logs、/readyz **没有鉴权**（AGENTS.md §4），靠网络层兜住。
+#
+# ⚠️ 探针与这条策略会打架：readiness 打的是**管理端口**，而 kubelet 发起的探测来自节点 IP，
+#    不在 monitoring 命名空间里 —— 部分 CNI（Calico / Cilica 开启 HostEndpoint 限制时）会把它拦掉，
+#    表现为 Pod 一直 not ready 但 `kubectl logs` 看着正常。两种解法：给策略补一条节点网段的 from，
+#    或把 readiness 改成走业务端口上自建的只读路径（但语义会退化：`/readyz` 只在管理端口提供）。
+#    先按 `kubectl describe pod` 里的 `Readiness probe failed` 文案判断，别盲改。
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -130,6 +181,8 @@ spec:
         - port: admin
           protocol: TCP
 ---
+# 入站 TLS 由这里的 Ingress 终结（网关自己不监听 TLS），`GW_TRUSTED_PROXIES` 必须包含
+# Ingress Controller 的网段 —— 否则网关不采信 XFF，限流维度会退化成"Ingress 那一个地址"。
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

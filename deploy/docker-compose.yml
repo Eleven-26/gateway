@@ -1,90 +1,116 @@
-# 演示栈一键起：网关 + 三个演示后端（A 额外开 gRPC）。
+# 演示栈一键起：网关 + 三个演示后端（A 额外开 gRPC）+ 共享状态服务。
 #
 # 用法：
 #   docker compose -f deploy/docker-compose.yml up -d --build
-#   网关业务端口 http://localhost:18080 ，管理端点 http://localhost:18081
+#   业务入口 http://localhost:18080 ，管理端点 http://localhost:18081
+#   收尾：   docker compose -f deploy/docker-compose.yml down -v
 #
-# ⚠️ 关于网络模式
-#   下面用环境变量把监听地址指到 0.0.0.0 即可，**bridge 网络就能直接跑通**：
-#   `ports:` 映射到容器内 0.0.0.0:18080/18081，宿主机用 localhost:18080 / :18081 访问。
-#   如果不想用环境变量，也可以用 host 网络模式（容器与宿主机共用回环，此时内置的 127.0.0.1 直接可用）。
+# 可观测栈是**可选**的（默认不起，避免没人用也占两个端口、还要拉镜像）：
+#   docker compose -f deploy/docker-compose.yml --profile observability up -d
+#
+# ⚠️ 三条与镜像强相关的约束，别照抄改坏：
+#   1. 监听地址必须由环境变量给（GW_LISTEN_ADDR / GW_ADMIN_LISTEN_ADDR）。不设就退回内置默认的
+#      127.0.0.1，容器里绑回环 → Service/端口映射都转发不进去，表现为「容器在跑但连不上」。
+#   2. 上游地址要用 **compose 服务名**（`deploy/config.compose.json` 里就是 backend-a:19001 这样）。
+#      写 127.0.0.1 指的是网关容器自己的回环，打不到同网络里的 backend 容器。
+#   3. 镜像是 distroless/static：**没有 shell、没有 curl**，所以 compose 的 `healthcheck` 探不了 HTTP
+#      —— 别写 `["CMD", "/app/backend", "-h"]` 这种恒为 0 的假检查（flag 包对 -h 返回 0，容器永远"健康"）。
+#      就绪判定交给外层：k8s 用 httpGet 探针（kubelet 发请求，不需要容器内工具），本机用宿主机 curl。
+#
+# 配置与密钥的注入顺序（后者覆盖前者）：内置默认值 → GW_CONFIG 指向的 JSON → 环境变量。
+# 密钥不进仓库：compose 会自动读同目录的 .env 做变量插值 —— 从模板复制一份：
+#   cp deploy/.env.example deploy/.env     （deploy/.env 已在 .gitignore 里）
+# 模板里的 GW_JWT_SECRET / GW_API_KEY 留空则退回配置文件 / 内置默认值（演示够用，生产必须显式注入）；
+# RUNTIME_IMAGE 只在 gcr.io 不可达时才需要设。
 
 services:
   gateway:
     build:
       context: ..
       dockerfile: Dockerfile
+      args:
+        # gcr.io 不可达时（内网/镜像站环境）在 deploy/.env 里设
+        #   RUNTIME_IMAGE=gcr.nju.edu.cn/distroless/static-debian12:nonroot
+        # 不用改 Dockerfile。
+        RUNTIME_IMAGE: "${RUNTIME_IMAGE:-gcr.io/distroless/static-debian12:nonroot}"
     image: gateway:dev
-    command: ["/app/gateway"]
     environment:
-      # 不设则退回内置的 127.0.0.1:18080 / :18081（容器里就访问不到了）
       GW_LISTEN_ADDR: "0.0.0.0:18080"
       GW_ADMIN_LISTEN_ADDR: "0.0.0.0:18081"
-      # 可选：挂一份 JSON 配置（覆盖语义）。挂载示例见文件末尾注释。
       GW_CONFIG: "/etc/gateway/config.json"
+      GW_JWT_SECRET: "${GW_JWT_SECRET:-}"
+      GW_API_KEY: "${GW_API_KEY:-}"
+      # 直连对端可信才采信 X-Forwarded-For / X-Real-IP（留空 = 一个字节都不读，最安全）。
+      # 网关前面还有一层反代时才需要填，值填那一跳的网段；compose 的 NAT 地址不是代理，不要填它。
+      # GW_TRUSTED_PROXIES: "172.16.0.0/12"
     volumes:
-      - ./config.json:/etc/gateway/config.json:ro
+      - ./config.compose.json:/etc/gateway/config.json:ro
     ports:
-      - "18080:18080"   # 业务入口
-      - "18081:18081"   # 管理端点（/metrics、/debug/logs、/readyz）—— 生产只应绑内网
-    # network_mode: host   # ← 见文件顶部说明，用环境变量时不需要
+      - "127.0.0.1:18080:18080" # 业务入口
+      - "127.0.0.1:18081:18081" # 管理端点（/metrics、/debug/logs、/readyz）：只绑回环，不对局域网开放
     depends_on:
+      - statestore
       - backend-a
       - backend-b
       - backend-c
-    healthcheck:
-      # /healthz 只代表进程活着；就绪看管理端口的 /readyz（它会检查熔断与节点摘除状态）
-      test: ["CMD", "/app/backend", "-h"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
+    # 配置是 bind mount，改完宿主机文件 3 秒内热重载（日志 `配置已热重载: ...`）：
+    #   docker compose -f deploy/docker-compose.yml logs -f gateway
+
+  # 共享状态服务：限流桶 + 熔断打开状态，跨副本共享时用（这里只有一个网关副本，配上是为了演示降级语义）。
+  # **不发布端口**：它没有鉴权，网关通过 compose 网络里的 http://statestore:18090 访问就够了。
+  #
+  # ⚠️ 覆盖二进制要用 entrypoint，不是 command：镜像的 ENTRYPOINT 是 /app/gateway，
+  #    只写 command 会被**追加**成 `/app/gateway /app/statestore ...`（表现为"容器在跑但端口没人听"）。
+  #    entrypoint 换掉可执行文件后，flag 仍然交给 command 传。
+  statestore:
+    image: gateway:dev
+    entrypoint: ["/app/statestore"]
+    command: ["-listen", "0.0.0.0:18090"]
+    # ports:
+    #   - "127.0.0.1:18090:18090"   # ← 只有要在宿主机直接调它的 API 时才临时打开
 
   # 演示后端 A：HTTP + gRPC（网关的 order-create 路由走它）
   backend-a:
     image: gateway:dev
-    command: ["/app/backend", "-http", "0.0.0.0:19001", "-grpc", "0.0.0.0:19100", "-name", "A"]
+    entrypoint: ["/app/backend"]
+    command: ["-http", "0.0.0.0:19001", "-grpc", "0.0.0.0:19100", "-name", "A"]
     ports:
-      - "19001:19001"
-      - "19100:19100"
+      - "127.0.0.1:19001:19001"
+      - "127.0.0.1:19100:19100"
 
   backend-b:
     image: gateway:dev
-    command: ["/app/backend", "-http", "0.0.0.0:19002", "-name", "B"]
+    entrypoint: ["/app/backend"]
+    command: ["-http", "0.0.0.0:19002", "-name", "B"]
     ports:
-      - "19002:19002"
+      - "127.0.0.1:19002:19002"
 
   # 演示后端 C：`/__control?fail=1` 与 `?ms=` 都在它上面演示（熔断、节点摘除、least_conn）
   backend-c:
     image: gateway:dev
-    command: ["/app/backend", "-http", "0.0.0.0:19003", "-name", "C"]
+    entrypoint: ["/app/backend"]
+    command: ["-http", "0.0.0.0:19003", "-name", "C"]
     ports:
-      - "19003:19003"
+      - "127.0.0.1:19003:19003"
 
-  # 共享状态服务（审计 C4，只在多副本时才需要）：限流桶 + 熔断打开状态
-  # 把网关配置里的 shared_state.url 指到 http://statestore:18090 即可
-  statestore:
-    image: gateway:dev
-    command: ["/app/statestore", "-listen", "0.0.0.0:18090"]
-    ports:
-      - "18090:18090"   # 生产不要对外暴露：它没有鉴权
-  # 可观测栈（可选）：Prometheus 抓 /metrics，Grafana 用随附看板
+  # 可观测栈（可选，--profile observability 才起）：Prometheus 抓 /metrics，Grafana 用随附看板。
   prometheus:
     image: prom/prometheus:latest
+    profiles: ["observability"]
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "9090:9090"
-    # network_mode: host   # 与网关一致；host 模式下 prometheus.yml 里的 127.0.0.1:18081 才通
+      - "127.0.0.1:9090:9090"
 
   grafana:
     image: grafana/grafana:latest
+    profiles: ["observability"]
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
     volumes:
       - ./observability/grafana-dashboard.json:/var/lib/grafana/dashboards/gateway.json:ro
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - prometheus

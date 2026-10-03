@@ -23,3 +23,10 @@ __pycache__/
 *.pyc
 
 deploy/config.json
+
+# 本地密钥（compose 的变量插值会读 deploy/.env）—— 带密钥的文件一律不进仓库
+.env
+.env.*
+*.env
+# 例外：模板要进仓库，供 `cp deploy/.env.example deploy/.env`
+!.env.example

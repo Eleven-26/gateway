@@ -1,0 +1,15 @@
+# 构建上下文只留源码：编译产物、日志、git 对象与文档都不进镜像层（否则每次本地 build 都让缓存失效）。
+.git
+.gitignore
+bin/
+*.exe
+*.exe~
+*.log
+docs/
+scripts/
+.workbuddy/
+.github/
+deploy/
+Dockerfile
+docker-compose.yml
+*.md

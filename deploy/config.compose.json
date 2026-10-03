@@ -1,0 +1,173 @@
+{
+  "_说明": [
+    "演示栈（deploy/docker-compose.yml）专用配置：upstream 用 compose 服务名而不是 127.0.0.1。",
+    "语义回顾：routes / services 是**整体替换**，写了就要写全；没写的字段沿用 internal/config 的 Default()。",
+    "时长一律字符串（\"2s\"）；字段名拼错 = 启动失败（下划线开头的 key 当注释忽略）。",
+    "密钥不写在文件里：由环境变量 GW_JWT_SECRET / GW_API_KEY 注入（见 compose 的 environment 段）。",
+    "本机直接跑也行：GW_CONFIG=deploy/config.compose.json bin/gateway（19001~19003 需在监听，否则 502）。"
+  ],
+
+  "_trusted_proxies_说明": [
+    "compose 里直连对端是 Docker 的 NAT 地址，不是「会写 XFF 的代理」，所以留空 = 一个字节都不读 XFF（最安全）。",
+    "要在容器里演示真实客户端 IP：前面再挂一层反代，并把 GW_TRUSTED_PROXIES 指到那一跳所在的网段。"
+  ],
+  "trusted_proxies": [],
+
+  "_shared_state_说明": [
+    "限流桶与熔断状态跨副本共享（compose 里 statestore 服务提供）。",
+    "statestore 挂掉时按降级处理：限流 fail_open 放行、熔断退回本地状态机，并计入 gw_shared_state_errors_total。"
+  ],
+  "shared_state": {
+    "url": "http://statestore:18090",
+    "timeout": "200ms",
+    "fail_open": true,
+    "sync_interval": "1s"
+  },
+
+  "services": {
+    "self": {
+      "name": "self",
+      "balance": "round_robin",
+      "timeout": "1s",
+      "breaker": { "window_size": 10, "fail_ratio": 0.5, "min_requests": 4, "open_for": "3s", "half_open_max": 2 }
+    },
+    "order-svc": {
+      "name": "order-svc",
+      "balance": "round_robin",
+      "upstreams": [
+        { "addr": "backend-a:19001", "weight": 1, "backend": 1 },
+        { "addr": "backend-b:19002", "weight": 1, "backend": 2 },
+        { "addr": "backend-c:19003", "weight": 1, "backend": 3 }
+      ],
+      "timeout": "2s",
+      "breaker": { "window_size": 10, "fail_ratio": 0.5, "min_requests": 4, "open_for": "3s", "half_open_max": 2 },
+      "ejection": { "fail_threshold": 3, "cooldown": "5s" }
+    },
+    "user-svc": {
+      "name": "user-svc",
+      "balance": "consistent_hash",
+      "hash_key_from": "X-User-Id",
+      "upstreams": [
+        { "addr": "backend-a:19001", "backend": 1 },
+        { "addr": "backend-b:19002", "backend": 2 },
+        { "addr": "backend-c:19003", "backend": 3 }
+      ],
+      "timeout": "2s",
+      "breaker": { "window_size": 10, "fail_ratio": 0.5, "min_requests": 4, "open_for": "3s", "half_open_max": 2 },
+      "ejection": { "fail_threshold": 3, "cooldown": "5s" }
+    },
+    "flaky-svc": {
+      "_说明": "故意不配 ejection：这条服务演示的是**服务级熔断**（节点级摘除会先把坏节点摘掉，熔断器就看不到了）。",
+      "name": "flaky-svc",
+      "balance": "round_robin",
+      "upstreams": [{ "addr": "backend-c:19003", "backend": 3 }],
+      "timeout": "1s",
+      "breaker": { "window_size": 10, "fail_ratio": 0.5, "min_requests": 4, "open_for": "3s", "half_open_max": 2 }
+    },
+    "slow-svc": {
+      "_说明": "least_conn：必须用 ?ms= 把连接占住，否则串行请求在途恒为 0，退化成平局轮转。",
+      "name": "slow-svc",
+      "balance": "least_conn",
+      "upstreams": [
+        { "addr": "backend-a:19001", "backend": 1 },
+        { "addr": "backend-b:19002", "backend": 2 },
+        { "addr": "backend-c:19003", "backend": 3 }
+      ],
+      "timeout": "10s",
+      "breaker": { "window_size": 10, "fail_ratio": 0.5, "min_requests": 4, "open_for": "3s", "half_open_max": 2 },
+      "ejection": { "fail_threshold": 3, "cooldown": "5s" }
+    },
+    "grpc-order-svc": {
+      "_说明": "只有 backend-a 开 gRPC（compose 里给它 -grpc 参数）。",
+      "name": "grpc-order-svc",
+      "balance": "round_robin",
+      "upstreams": [{ "addr": "backend-a:19100", "grpc": true, "backend": 1 }],
+      "timeout": "3s",
+      "breaker": { "window_size": 10, "fail_ratio": 0.5, "min_requests": 4, "open_for": "3s", "half_open_max": 2 }
+    }
+  },
+
+  "routes": [
+    {
+      "name": "public-health",
+      "host": "*",
+      "path": "/healthz",
+      "path_type": "exact",
+      "upstream": "self"
+    },
+    {
+      "_说明": "host 一律写 * ：compose 里用 curl localhost 直接打，不用改 Host 头或 hosts。",
+      "name": "order-exact",
+      "host": "*",
+      "path": "/api/order/list",
+      "path_type": "exact",
+      "methods": ["GET"],
+      "upstream": "order-svc",
+      "limit": { "rate_per_sec": 50, "burst": 10 }
+    },
+    {
+      "name": "order-prefix",
+      "host": "*",
+      "path": "/api/order/",
+      "path_type": "prefix",
+      "strip_prefix": "/api",
+      "upstream": "order-svc",
+      "auth": { "required": true, "scheme": "jwt" },
+      "limit": { "rate_per_sec": 20, "burst": 5 }
+    },
+    {
+      "name": "user-regex",
+      "host": "*",
+      "path": "^/api/users/\\d+$",
+      "path_type": "regex",
+      "methods": ["GET"],
+      "upstream": "user-svc",
+      "auth": { "required": true, "scheme": "jwt" },
+      "limit": { "rate_per_sec": 10, "burst": 3 }
+    },
+    {
+      "name": "user-mobile",
+      "host": "*",
+      "path": "/api/users/me",
+      "path_type": "exact",
+      "headers": { "X-Client": "mobile" },
+      "upstream": "user-svc",
+      "auth": { "required": true, "scheme": "jwt" }
+    },
+    {
+      "_说明": "5/s + burst 2：故意小，方便在容器里当场打出 429。",
+      "name": "open-api",
+      "host": "*",
+      "path": "/open/",
+      "path_type": "prefix",
+      "upstream": "order-svc",
+      "auth": { "required": true, "scheme": "apikey" },
+      "limit": { "rate_per_sec": 5, "burst": 2 }
+    },
+    {
+      "name": "flaky",
+      "host": "*",
+      "path": "/flaky",
+      "path_type": "exact",
+      "upstream": "flaky-svc"
+    },
+    {
+      "name": "slow",
+      "host": "*",
+      "path": "/slow",
+      "path_type": "exact",
+      "upstream": "slow-svc"
+    },
+    {
+      "name": "order-create",
+      "host": "*",
+      "path": "/api/orders",
+      "path_type": "exact",
+      "methods": ["POST"],
+      "upstream": "grpc-order-svc",
+      "auth": { "required": true, "scheme": "jwt", "roles": ["admin", "user"] },
+      "limit": { "rate_per_sec": 10, "burst": 3 },
+      "transcode": { "service": "order.OrderService", "method": "CreateOrder" }
+    }
+  ]
+}

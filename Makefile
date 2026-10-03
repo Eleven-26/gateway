@@ -4,17 +4,20 @@
 
 BIN_DIR := bin
 
-.PHONY: all build gateway backend hashring fmt vet test tidy run-gateway run-backend clean
+.PHONY: all build gateway backend statestore hashring fmt vet test tidy run-gateway run-backend clean
 
 all: build
 
-build: gateway backend hashring
+build: gateway backend statestore hashring
 
 gateway:
 	go build -o $(BIN_DIR)/gateway ./cmd/gateway
 
 backend:
 	go build -o $(BIN_DIR)/backend ./cmd/backend
+
+statestore:
+	go build -o $(BIN_DIR)/statestore ./cmd/statestore
 
 hashring:
 	go build -o $(BIN_DIR)/hashring ./cmd/hashring
