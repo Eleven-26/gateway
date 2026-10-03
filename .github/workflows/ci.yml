@@ -1,5 +1,5 @@
 # CI：本机（Windows）跑不了 `go test -race`（CGO_ENABLED=0 且无 gcc，见 AGENTS.md §3），
-# 所以竞态检测只在 Linux runner 上做；同时把 gofmt / vet / 全量测试与三个入口的构建都钉住。
+# 所以竞态检测只在 Linux runner 上做；同时把 gofmt / vet / 全量测试与四个入口的构建都钉住。
 name: ci
 
 on:
@@ -37,10 +37,11 @@ jobs:
       - name: go test -race
         run: go test -race ./... -count=1
 
-      - name: build 三个入口
+      - name: build 四个入口
         run: |
           go build -o bin/gateway ./cmd/gateway
           go build -o bin/backend ./cmd/backend
+          go build -o bin/statestore ./cmd/statestore
           go build -o bin/hashring ./cmd/hashring
 
       # 基准与容量相关：不设阈值（机器差异大），但把数字留在日志里便于对比

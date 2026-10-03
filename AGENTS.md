@@ -24,7 +24,7 @@
    `.env.example`（compose 变量插值模板；真实的 `deploy/.env` 不进仓库）、
    `k8s/{gateway,backend,statestore}.yaml`、`observability/{prometheus.yml,grafana-dashboard.json}`）、
    根目录 `Dockerfile`（多阶段构建，四个入口进同一镜像）与 `.dockerignore`、
-   `.github/workflows/`（CI：gofmt 卡口 + vet + `-race` + 三入口构建 + 基准记录）。
+   `.github/workflows/`（CI：gofmt 卡口 + vet + `-race` + 四入口构建 + 基准记录）。
 2. **仓库内不放编译产物**：`bin/`、`*.exe`、`*.exe~`、`*.log` 均已进 `.gitignore`。产物统一 `make build` 到 `bin/`。
 3. **依赖方向单向**，改代码时不要引入反向依赖：
 

@@ -40,7 +40,7 @@ TraceID → ① 路由 → ② 鉴权 → ③ 限流 → ③ 熔断 → ④ 选�
 │                               config.compose.json（演示栈实际加载的那份）、.env.example（密钥模板）、
 │                               k8s/{gateway,backend,statestore}.yaml、observability/*
 ├── Dockerfile                  多阶段构建镜像（gateway/backend/statestore/hashring 进同一镜像）
-├── .github/workflows/          CI（ci.yml：gofmt 卡口 + vet + go test -race + 三入口构建 + 基准记录）
+├── .github/workflows/          CI（ci.yml：gofmt 卡口 + vet + go test -race + 四入口构建 + 基准记录）
 ├── docs/                       文档
 │   ├── 项目地图.md               文件/依赖/链路/配置/改动定位的行号级索引（先看这份）
 │   ├── 项目分析与执行链路.md      模块详解 + 真实实测输出
