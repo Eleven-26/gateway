@@ -45,6 +45,15 @@
    工厂按 `Balance` 分发、节点级摘除与 fail-open、节点级指标）；
    **改任一处都要跑 `make test`** —— 在途计数只增不减这类错误串行请求看不出来，
    只能靠单测 + 并发/A-B 实测兜住。
+8. **需要实测的一律在本机 Docker Desktop 里跑**（用户级约定，2026-10-03 起，覆盖所有仓库）：验收环境统一
+   `docker compose -f deploy/docker-compose.yml up -d --build`（基镜像不可达时在 `deploy/.env` 里
+   `RUNTIME_IMAGE=gcr.nju.edu.cn/distroless/static-debian12:nonroot`），不在宿主机起 `bin/*` 长驻进程，
+   也不以"本机没环境 / 只能静态核对"为由跳过实测。
+   - 服务依赖（MySQL / Redis / ES / Kafka…）临时起在同一条 compose 里，验收完 `down -v`；
+   - 限流这类要毫秒级并发的验证仍按 §3：容器内用 Python（`urllib` + `threading`）、curl 加 `--noproxy '*'`；
+   - 边界：只适用于**跑起来验行为**。编译、`go vet`、单测（`make test` / `make race`）、gofmt 直接在宿主机做；
+     k8s 清单没有集群，维持"离线结构核对 + 如实标注"（§5）；
+   - 可观测栈：`docker compose -f deploy/docker-compose.yml --profile observability up -d`。
 
 ## 2. 关键常量
 
@@ -128,6 +137,7 @@
 
 ## 3. 本机运行注意事项（实测踩过）
 
+- **验收环境一律用 Docker Desktop（§1 规则 8）**，本节剩下的本机二进制技巧只在没有容器路径时兜底。
 - **长驻进程要「分离」启动**：`Start-Process -FilePath bin\gateway -RedirectStandardOutput bin\gw.log`。
   本轮实测用后台任务包装器启动 `bin/gateway` / `bin/backend` 时，任务立刻返回「exit 0」而进程不留
   （表现为 curl 全部 connection refused）；`Start-Process -PassThru` 起得来、`HasExited=False`。
