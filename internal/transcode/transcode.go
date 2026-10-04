@@ -42,6 +42,8 @@ func init() { encoding.RegisterCodec(jsonCodec{}) }
 
 // Pool 按地址复用 gRPC 连接。
 type Pool struct {
+	// Mutex = 一把锁，保护共享数据的每一次访问。保护 map，防并发读写 panic。不可重入，必须成对，defer Unlock。
+	// 区别：Once = 一次性的开关，保证某段代码只执行一次。惰性初始化用，不可重置，内部靠锁 + 原子实现。
 	mu    sync.Mutex
 	conns map[string]*grpc.ClientConn
 

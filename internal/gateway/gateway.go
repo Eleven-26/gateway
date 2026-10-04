@@ -75,7 +75,8 @@ type Gateway struct {
 	proxies   map[string]*proxy.Proxy
 }
 
-// snapshot 取当前配置快照（请求路径上只调一次，后续都用它）。
+// snapshot 取出当前生效的配置快照指针。（请求路径上只调一次，后续都用它）。
+// .Load() 是它的原子读操作，返回当前存进去的那个 *state。
 func (g *Gateway) snapshot() *state { return g.st.Load() }
 
 // newState 由配置构造一份快照：校验 → 解析可信代理 → 编译路由表 → 构造鉴权器。
@@ -102,29 +103,66 @@ func newState(cfg *config.Config) (*state, error) {
 }
 
 // New 装配一个网关。熔断器 / 均衡器 / 代理都是**按需惰性创建**并缓存的。
+/**
+完整装配流程图
+New(cfg)
+  │
+  ├─ 1. newState(cfg)                  ← 校验 + 解析可信代理 + 编译路由 + 构造鉴权器
+  │       └─ 失败 → return nil, err
+  │
+  ├─ 2. metrics := NewMetrics()        ← 指标注册表
+  │
+  ├─ 3. rl := newLimitBackend(cfg, onErr)  ← 按配置选本地/共享限流
+  │
+  ├─ 4. grpcPool := transcode.NewPool()    ← gRPC 连接池
+  │
+  ├─ 5. 初始化 breakers/balancers/proxies 三个空 map（惰性创建）
+  │
+  ├─ 6. g.gate = overload.New(...)     ← 可选：负载保护闸门
+  │       └─ 非 nil 时 AttachOverload 挂指标
+  │
+  ├─ 7. g.st.Store(st)                 ← 原子存储配置快照
+  │
+  ├─ 8. g.stop = make(chan struct{})   ← 关闭信号
+  │
+  ├─ 9. 如果配了 SharedState.URL:
+  │       └─ startSharedBreaker(cfg, metrics)  ← 启动后台同步协程
+  │
+  └─ return g, nil
+*/
 func New(cfg *config.Config) (*Gateway, error) {
-	// 校验配置 → 解析可信代理 → 编译路由表 → 构造鉴权器，产出一份配置快照。
+	// 1、校验配置 → 解析可信代理 → 编译路由表 → 构造鉴权器，产出一份配置快照。
 	st, err := newState(cfg)
 	if err != nil {
 		return nil, err
 	}
 
+	// 2、创建一个空的指标注册表，包含计数器（requests、limitHits、cbTrips、stateErrs、overloads、panics）和延迟样本
 	metrics := observability.NewMetrics()
 	g := &Gateway{
-		// 限流后端按配置选择：共享状态判定失败要计数，否则 fail-open 会把失效藏起来
-		rl:        newLimitBackend(cfg, func(error) { metrics.IncStateError("ratelimit") }),
-		grpcPool:  transcode.NewPool(),
-		metrics:   metrics,
-		alog:      observability.NewAccessLog(accessLogKeep),
-		breakers:  map[string]*breaker.Breaker{},
-		balancers: map[string]balancer.Balancer{},
-		proxies:   map[string]*proxy.Proxy{},
+		// 3、限流后端按配置选择：共享状态判定失败要计数，否则 fail-open 会把失效藏起来
+		rl: newLimitBackend(cfg, func(error) { metrics.IncStateError("ratelimit") }),
+		// 4、创建 gRPC 连接池，用于 HTTP → gRPC 协议转换。必须在 Close() 里释放：Gateway.Close() 会调用 g.grpcPool.Close()
+		grpcPool: transcode.NewPool(),
+		metrics:  metrics,
+		alog:     observability.NewAccessLog(accessLogKeep),
+		// 5、初始化惰性创建的三个 map
+		breakers:  map[string]*breaker.Breaker{},  // 服务名 → 熔断器
+		balancers: map[string]balancer.Balancer{}, // 服务名 → 负载均衡器
+		proxies:   map[string]*proxy.Proxy{},      // 服务名 + 节点地址 + strip 前缀 → 反向代理
 	}
+	// 6、负载保护闸门，即并发限制器（可选）
 	if g.gate = overload.New(cfg.Overload.MaxInflight, cfg.Overload.MaxQueue); g.gate != nil {
 		metrics.AttachOverload(g.gate.Limit(), g.gate.Stats)
 	}
+	// 7、原子替换存储配置快照，请求立刻看到新配置
+	// 必须在 startSharedBreaker 之前 Store：因为后台协程可能立即读 snapshot()
 	g.st.Store(st)
+
+	// 8、创建关闭信号，一个无缓冲 channel，用于通知后台协程退出
 	g.stop = make(chan struct{})
+
+	// 9、按需启动共享状态后台协程，只有配置了共享状态服务时才启动
 	if strings.TrimSpace(cfg.SharedState.URL) != "" {
 		g.startSharedBreaker(cfg, metrics)
 	}
@@ -145,6 +183,8 @@ func (g *Gateway) Close() {
 //
 // onErr 在共享后端判定失败（超时/连不上/非 2xx）时被调用，用来打 gw_shared_state_errors_total。
 func newLimitBackend(cfg *config.Config, onErr func(error)) ratelimit.Backend {
+	// SharedState.URL 为空	ratelimit.NewLocalBackend()	进程内令牌桶，单副本
+	// SharedState.URL 非空	ratelimit.NewHTTPBackend(...)	调用共享状态服务，多副本
 	if strings.TrimSpace(cfg.SharedState.URL) == "" {
 		return ratelimit.NewLocalBackend()
 	}

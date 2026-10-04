@@ -45,6 +45,7 @@ func (s *ReloadSummary) String() string {
 func (g *Gateway) Reload(cfg *config.Config) (*ReloadSummary, error) {
 	st, err := newState(cfg)
 	if err != nil {
+		// 失败就保持旧快照不变
 		return nil, err
 	}
 	old := g.st.Load()
@@ -110,7 +111,7 @@ func (g *Gateway) Reload(cfg *config.Config) (*ReloadSummary, error) {
 		}
 	}
 
-	// 最后一步才让请求看到新配置：上面任何一步失败都不会留下半成品
+	// 原子替换，最后一步才让请求看到新配置：上面任何一步失败都不会留下半成品
 	g.st.Store(st)
 
 	sort.Strings(sum.BreakerKept)

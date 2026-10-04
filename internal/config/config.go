@@ -37,7 +37,9 @@ type Config struct {
 //   - 读不到共享状态时**降级**而不是失败：限流按 FailOpen 决策，熔断退回本地状态机
 //     （功能不丢，只是退回单副本语义），但两者都会计入 gw_shared_state_errors_total。
 type SharedStateConfig struct {
-	URL          string   `json:"url,omitempty"`           // 服务基址（如 http://127.0.0.1:18090）；空 = 全在进程内
+	// URL 服务基址（如 http://127.0.0.1:18090）；空 = 全在进程内
+	// 共享则是单独的进程服务 cmd/statestore/main.go，数据存在 statestore 这个独立进程的内存里，由互斥锁保护，由互斥锁保护。后期可以改成redis
+	URL          string   `json:"url,omitempty"`
 	Timeout      Duration `json:"timeout,omitempty"`       // 单次访问超时；默认 200ms
 	FailOpen     *bool    `json:"fail_open,omitempty"`     // 限流判定失败时是否放行；默认 true
 	SyncInterval Duration `json:"sync_interval,omitempty"` // 熔断状态拉取间隔；默认 1s

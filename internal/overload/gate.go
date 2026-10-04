@@ -38,7 +38,7 @@ var (
 	ErrQueueTimeout = errors.New("排队等待超时")
 )
 
-// Gate 并发闸门。零值不可用，请用 New 构造；nil 表示"不启用"（Acquire 会直接放行）。
+// Gate 并发闸门，即并发限制器。零值不可用，请用 New 构造；nil 表示"不启用"（Acquire 会直接放行）。
 type Gate struct {
 	slots    chan struct{} // 容量 = 并发上限；channel 的等待队列天然 FIFO
 	maxQueue int64         // 允许同时排队的请求数
